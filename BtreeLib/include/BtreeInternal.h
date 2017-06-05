@@ -273,7 +273,7 @@ public:
   KeyPtrPair* GetKeyPtrPair(UINT indx)
   {
       KeyPtrPair* ptr = nullptr;
-      if (indx < m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved)
+      if (indx < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved))
       {
           ptr = &m_RecordArr[indx];
       }

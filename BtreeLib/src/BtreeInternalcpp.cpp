@@ -178,7 +178,7 @@ UINT BtLeafPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
     UINT  prevKeyLen = 0;
     UINT  errorCount = 0;
 
-    for (UINT i = 0; i < m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved; i++)
+    for (UINT i = 0; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
     {
         pre = GetKeyPtrPair(i);
         curKey = (pre->m_KeyLen > 0) ? (char*)(this) + pre->m_KeyOffset : nullptr;
@@ -229,7 +229,7 @@ void BtLeafPage::ShortPrint(FILE* file)
     char* lowKey   = (char*)(this) + pre->m_KeyOffset;
     char* hiKey    = (char*)(this) + pre->m_KeyOffset;
 
-    for (UINT i = 1; i < m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved; i++)
+    for (UINT i = 1; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
     {
         pre = GetKeyPtrPair(i);
         char* curKey = (char*)(this) + pre->m_KeyOffset;
@@ -499,8 +499,8 @@ int BtIndexPage::KeySearchGE(KeyType* searchKey )
   int pos = -1;
   KeyPtrPair* pre = nullptr;
   char* curKey = nullptr;
-  UINT cv = 0;
-  for (pos = 0; UINT(pos) < m_nSortedSet-1; pos++)
+  int cv = 0;
+  for (pos = 0; UINT(pos) < UINT(m_nSortedSet-1); pos++)
   {
 	pre = GetSortedEntry(pos); 
 	curKey = baseAddr + pre->m_KeyOffset;
@@ -570,7 +570,7 @@ BTRESULT BtIndexPage::ExpandIndexPage(char* separator, UINT sepLen, BtBasePage* 
     KeyPtrPair* pre = nullptr;
 
     UINT spos = 0;
-    for (UINT tpos = 0; tpos < m_nSortedSet+1; tpos++)
+    for (UINT tpos = 0; tpos < UINT(m_nSortedSet+1); tpos++)
     {
         if (tpos != oldPos)
         {
@@ -667,13 +667,17 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
     
     fprintf(stdout, "\n=== Splitting index page ========= \n");
     fprintf(stdout, "  === source: ");
-    ShortPrint(stdout);
+    //ShortPrint(stdout);
+    PrintPage(stdout, iter->m_Count);
     fprintf(stdout, "\n  ===   left: ");
-    leftPage->ShortPrint(stdout);
+    //leftPage->ShortPrint(stdout);
+    leftPage->PrintPage(stdout, iter->m_Count);
     fprintf(stdout, "\n              Separator: %1.*s\n", seplen, separator);
     fprintf(stdout, "  ===  right: ");
-    rightPage->ShortPrint(stdout);
+    //rightPage->ShortPrint(stdout);
+    rightPage->PrintPage(stdout, iter->m_Count);
     fprintf(stdout, "\n===================================\n");
+
 
     // Now install the two new pages
     if (iter->m_Count == 1)
@@ -682,6 +686,8 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
         BtIndexPage* indxPage = m_Btree->CreateIndexPage(leftPage, rightPage, separator, seplen);
         m_Btree->m_RootPage = indxPage;
         m_Btree->m_nIndexPages++;
+        fprintf(stdout, "==== New root page ======\n");
+        indxPage->PrintPage(stdout, 1);
     }
     else
     {
@@ -697,6 +703,8 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
         {
             // The b-tree object is the grandparent
             installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
+            fprintf(stdout, "====== New root page ======\n");
+            newIndxPage->PrintPage(stdout, 1);
         }
         else
         {
@@ -721,7 +729,9 @@ BTRESULT BtreeRoot::InsertRecord(KeyType* key, void* recptr)
         return BT_INVALID_ARG;
     }
     BtreeRootInternal* btreeInt = (BtreeRootInternal*)(this);
-    return btreeInt->InsertRecordInternal(key, recptr);
+    BTRESULT br = btreeInt->InsertRecordInternal(key, recptr);
+    btreeInt->CheckTree(stdout);
+    return br;
 }
 
 BTRESULT BtreeRoot::LookupRecord(KeyType* key, void*& recFound)
@@ -1206,7 +1216,7 @@ void BtLeafPage::ClosePage()
             LONG64 oldval = InterlockedCompareExchange64(&m_PageStatus.m_Status64, newst.m_Status64, pst.m_Status64);
         }
 
-        for (UINT i = 0; i < m_nSortedSet + pst.m_Status.m_nUnsortedReserved; i++)
+        for (UINT i = 0; i < UINT(m_nSortedSet + pst.m_Status.m_nUnsortedReserved); i++)
         {
             KeyPtrPair* kpp = GetKeyPtrPair(i);
             kpp->CloseEntry(); 

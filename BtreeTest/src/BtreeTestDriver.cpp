@@ -64,6 +64,7 @@ int main()
 	  break;
 	}
 
+   
     hr = btree->LookupRecord(&searchKey, recFound);
     if (hr != S_OK || recFound != srctable[indx])
     {
