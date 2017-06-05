@@ -150,7 +150,7 @@ tryagain:
     UINT count = m_nSortedSet + initStatus.m_Status.m_nUnsortedReserved;
     UINT size = sizeof(PermutationArray) + (count - 1)*sizeof(UINT16);
     HRESULT hre =  m_Btree->m_MemoryBroker->Allocate(size, (void**)&permArr, MemObjectType::TmpPointerArray);
-    new(permArr) PermutationArray(this, count, initStatus);
+    new(permArr) PermutationArray(this, count, &initStatus);
     if (initStatus.m_Status.m_nUnsortedReserved > 0)
     {
         hr = permArr->SortPermArray();
@@ -167,6 +167,20 @@ tryagain:
 
     return hr;
 
+}
+
+void BtLeafPage::ComputeTreeStats(BtreeStatistics* statsp)
+{
+  statsp->m_LeafPages++;
+  statsp->m_SpaceLP += m_PageSize;
+  statsp->m_AllocedSpaceLP += UINT(_msize(this));
+  statsp->m_HeaderSpaceLP += LeafPageHeaderSize();
+  statsp->m_KeySpaceLP += KeySpaceSize();
+  statsp->m_RecArrSpaceLP += (m_nSortedSet+m_PageStatus.m_Status.m_nUnsortedReserved) * sizeof(KeyPtrPair);
+  statsp->m_FreeSpaceLP += UnusedSpace();
+  statsp->m_DeletedSpaceLP += m_WastedSpace;
+  UINT hsize = UINT((char*)(&m_RecordArr[0]) - (char*)(this));
+  _ASSERTE(hsize == LeafPageHeaderSize());
 }
 
 UINT BtLeafPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
@@ -211,6 +225,16 @@ UINT BtLeafPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
 
     }
 
+	// Check permutatiom array
+	if (m_PermArr)
+	{
+	  if (m_PageStatus.m_Status64 == m_PermArr->m_CreateStatus.m_Status64)
+	  {
+		_ASSERTE(m_PermArr->m_TargetPage == this);
+		_ASSERTE(m_PermArr->m_nrEntries == m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved);
+	  }
+	}
+
     if (errorCount > 0)
     {
         PrintPage(stdout, 0);
@@ -223,13 +247,15 @@ void BtLeafPage::ShortPrint(FILE* file)
 {
     fprintf(file, " LP@0x%llx, %dB, %d+%d", UINT64(this), m_PageSize, m_nSortedSet, m_PageStatus.m_Status.m_nUnsortedReserved);
 
+	if (m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved > 0)
+	{
     KeyPtrPair* pre = GetKeyPtrPair(0);    
     UINT lowKeyLen = pre->m_KeyLen; 
     UINT hiKeyLen  = pre->m_KeyLen;
     char* lowKey   = (char*)(this) + pre->m_KeyOffset;
     char* hiKey    = (char*)(this) + pre->m_KeyOffset;
 
-    for (UINT i = 1; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
+	  for (UINT i = 1; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
     {
         pre = GetKeyPtrPair(i);
         char* curKey = (char*)(this) + pre->m_KeyOffset;
@@ -250,6 +276,11 @@ void BtLeafPage::ShortPrint(FILE* file)
     fprintf(file, " \"%1.*s\",", lowKeyLen, lowKey);
     fprintf(file, " \"%1.*s\" ", hiKeyLen, hiKey);
 }
+	else
+	{
+	  fprintf(file, "empty");
+	}
+}
 
 void BtLeafPage::PrintPage(FILE* file, UINT level)
 {
@@ -267,14 +298,14 @@ void BtLeafPage::PrintPage(FILE* file, UINT level)
   }
 
   UINT arrSpace = (m_nSortedSet + nUnsorted) * sizeof(KeyPtrPair);
-  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_FirstFreeByte -1;
-  UINT32 freeSpace = m_PageSize - PageHeaderSize() - arrSpace - keySpace;
+  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_LastFreeByte -1;
+  UINT32 freeSpace = m_PageSize - LeafPageHeaderSize() - arrSpace - keySpace;
   
   fprintf(file, "Size %d, Usage:  hdr %d array(%d+%d) %d keys %d free %d deleted %d\n", 
-	m_PageSize, PageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
+	m_PageSize, LeafPageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
   fprintf(file, "State: %d, reserved %d, cleared %d, first free %d\n", 
 	m_PageStatus.m_Status.m_PageState, m_PageStatus.m_Status.m_nUnsortedReserved,
-	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_FirstFreeByte);
+	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_LastFreeByte);
 
   char* baseAddr = (char*)(this);
 
@@ -307,10 +338,39 @@ void BtIndexPage::ShortPrint(FILE* file)
     KeyPtrPair* pre = GetSortedEntry(0);
     char* sep = (char*)(this) + pre->m_KeyOffset;
     fprintf(file, " \"%1.*s\",", pre->m_KeyLen, sep);
-
+	if (m_nSortedSet >= 2)
+	{
     pre = GetSortedEntry(m_nSortedSet-2);
     sep = (char*)(this) + pre->m_KeyOffset;
     fprintf(file, " \"%1.*s\" ", pre->m_KeyLen, sep);
+}
+}
+
+void BtIndexPage::ComputeTreeStats(BtreeStatistics* statsp)
+{
+  statsp->m_IndexPages++;
+  statsp->m_SpaceIP += m_PageSize;
+  statsp->m_AllocedSpaceIP += UINT(_msize(this));
+  statsp->m_HeaderSpaceIP += IndexPageHeaderSize();
+  statsp->m_KeySpaceIP += KeySpaceSize();
+  statsp->m_RecArrSpaceIP += m_nSortedSet * sizeof(KeyPtrPair);
+
+  for (UINT i = 0; i < m_nSortedSet; i++)
+  {
+	KeyPtrPair* pre = GetSortedEntry(i);
+	BtBasePage* page = (BtBasePage*)(const_cast<void*>(pre->m_RecPtr));
+	if (page->IsIndexPage())
+	{
+	  BtIndexPage* ip = (BtIndexPage*)(page);
+	  ip->ComputeTreeStats(statsp);
+	}
+	else
+	{
+	  BtLeafPage* lp = (BtLeafPage*)(page);
+	  lp->ComputeTreeStats(statsp);
+	}
+  }
+
 }
 
 UINT BtIndexPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
@@ -366,7 +426,7 @@ UINT BtIndexPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
     KeyType lb;
     KeyType hb;
    
-    lb = lowBound;
+    lb = *lowBound;
     for (UINT i = 0; i < m_nSortedSet; i++)
     {
         pre = GetSortedEntry(i);
@@ -376,7 +436,15 @@ UINT BtIndexPage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
 
         if (pre->m_RecPtr)
         {
-            errorCount += ((BtBasePage*)(pre->m_RecPtr))->CheckPage(file, &lb, &hb);
+		  BtBasePage* pg = (BtBasePage*)(pre->m_RecPtr);
+		  if (pg->IsIndexPage())
+		  {
+			errorCount += ((BtIndexPage*)(pg))->CheckPage(file, &lb, &hb);
+        }
+		  else
+		  {
+			errorCount += ((BtLeafPage*)(pg))->CheckPage(file, &lb, &hb);
+		  }
         }
 
         lb = hb;
@@ -401,14 +469,14 @@ void BtIndexPage::PrintPage(FILE* file, UINT level)
   }
 
   UINT arrSpace = (m_nSortedSet + nUnsorted) * sizeof(KeyPtrPair);
-  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_FirstFreeByte -1;
-  UINT32 freeSpace = m_PageSize - PageHeaderSize() - arrSpace - keySpace;
+  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_LastFreeByte -1;
+  UINT32 freeSpace = m_PageSize - IndexPageHeaderSize() - arrSpace - keySpace;
 
   fprintf(file, "Size %d, Usage:  hdr %d array(%d+%d) %d keys %d free %d deleted %d\n",
-	m_PageSize, PageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
+	m_PageSize, IndexPageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
   fprintf(file, "State: %d, reserved %d, cleared %d, first free %d\n",
 	m_PageStatus.m_Status.m_PageState, m_PageStatus.m_Status.m_nUnsortedReserved,
-	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_FirstFreeByte);
+	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_LastFreeByte);
 
   char* baseAddr = (char*)(this);
 
@@ -433,8 +501,8 @@ void BtIndexPage::PrintPage(FILE* file, UINT level)
   {
 	KeyPtrPair* pe = GetSortedEntry(i);
     BtBasePage* pg = (BtBasePage*)(pe->m_RecPtr);
-    if (pg->IsIndexPage()) pg->PrintPage(file, level+1);
-    //if (pg->IsLeafPage()) ((BtLeafPage*)pg)->ShortPrint(file);
+    if (pg->IsIndexPage()) ((BtIndexPage*)(pg))->PrintPage(file, level+1);
+    //if (pg->IsLeafPage()) ((BtLeafPage*)(pg))->ShortPrint(file);
   }
 }
 
@@ -446,7 +514,7 @@ void BtreeRoot::Print(FILE* file)
 
 }
 
-BtBasePage* BtreeRootInternal::CreateEmptyPage()
+BtBasePage* BtreeRootInternal::CreateEmptyLeafPage()
 {
   BtLeafPage* page = nullptr;
   HRESULT hre = m_MemoryBroker->Allocate(m_MinPageSize, (void**)(&page), MemObjectType::LeafPage);
@@ -460,30 +528,26 @@ BtBasePage* BtreeRootInternal::CreateEmptyPage()
 
 BtIndexPage* BtreeRootInternal::CreateIndexPage(BtBasePage* leftPage, BtBasePage* rightPage, char* separator, UINT sepLen)
 {
+  KeyType hibound;
+  KeyType::GetMaxValue(hibound.m_pKeyValue, hibound.m_KeyLen);  
+
+  UINT keySpace = sepLen + hibound.m_KeyLen;
+  UINT pageSize = ComputeIndexPageSize(2, keySpace);
 
   BtIndexPage* page = nullptr;
-  HRESULT hre = m_MemoryBroker->Allocate(m_MinPageSize, (void**)(&page), MemObjectType::IndexPage);
+  HRESULT hre = m_MemoryBroker->Allocate(pageSize, (void**)(&page), MemObjectType::IndexPage);
   if (page)
   {
-	new(page) BtIndexPage(m_MinPageSize, this);
+	new(page) BtIndexPage(pageSize, this);
+
+	// Store separator key first and then the high bound
+	page->AppendToSortedSet(separator, sepLen, leftPage);
+	page->AppendToSortedSet(hibound.m_pKeyValue, hibound.m_KeyLen, rightPage);
+
+	UINT frontSize = UINT(BtIndexPage::IndexPageHeaderSize() + 2*sizeof(KeyPtrPair));
+	UINT backSize = page->KeySpaceSize();
+	_ASSERTE(frontSize + backSize == pageSize);
   }
-
-  // Store separator key first
-  UINT offset = page->m_PageStatus.m_Status.m_FirstFreeByte - sepLen + 1;
-  page->m_PageStatus.m_Status.m_FirstFreeByte = offset - 1;
-  memcpy((char*)(page)+offset, separator, sepLen);
-
-  page->m_nSortedSet = 2;
-  KeyPtrPair* prel = page->GetSortedEntry(0);
-  prel->Set(offset, sepLen, leftPage);
-
-  KeyType hibound;
-  KeyType::GetMaxValue(hibound.m_pKeyValue, hibound.m_KeyLen);
-  offset -= hibound.m_KeyLen;
-  memcpy((char*)(page)+offset, hibound.m_pKeyValue, hibound.m_KeyLen);
-  KeyPtrPair* prer = page->GetSortedEntry(1);
-  prer->Set(offset, hibound.m_KeyLen, rightPage);
-
   return page;
 }
 
@@ -491,7 +555,7 @@ BtIndexPage* BtreeRootInternal::CreateIndexPage(BtBasePage* leftPage, BtBasePage
 int BtIndexPage::KeySearchGE(KeyType* searchKey )
 {
   // On index pages, an entry points to a page containing records with keys that are less than or equal to the separator
-  _ASSERTE(m_nSortedSet >= 2);
+  //_ASSERTE(m_nSortedSet >= 2);
 
   char* baseAddr = (char*)(this); 
 
@@ -532,13 +596,13 @@ int BtIndexPage::KeySearchGE(KeyType* searchKey )
 
 UINT BtIndexPage::AppendToSortedSet(char* separator, UINT sepLen, void* ptr)
 {
-    m_PageStatus.m_Status.m_FirstFreeByte -= sepLen;
-    char* dst = (char*)(this) + m_PageStatus.m_Status.m_FirstFreeByte + 1;
+    m_PageStatus.m_Status.m_LastFreeByte -= sepLen;
+    char* dst = (char*)(this) + m_PageStatus.m_Status.m_LastFreeByte + 1;
     memcpy_s(dst, sepLen, separator, sepLen);
 
     m_nSortedSet++;    
     KeyPtrPair* pre = GetSortedEntry(m_nSortedSet-1);
-    pre->Set(m_PageStatus.m_Status.m_FirstFreeByte + 1, sepLen, ptr);
+    pre->Set(m_PageStatus.m_Status.m_LastFreeByte + 1, sepLen, ptr);
  
     return m_nSortedSet;
 }
@@ -550,7 +614,7 @@ UINT BtIndexPage::AppendToSortedSet(char* separator, UINT sepLen, void* ptr)
 BTRESULT BtIndexPage::ExpandIndexPage(char* separator, UINT sepLen, BtBasePage* leftPage, BtBasePage* rightPage, UINT oldPos, BtIndexPage*& newPage)
 {
     BTRESULT btr = BT_SUCCESS;
-    UINT pageSize = ComputePageSize(m_nSortedSet + 1, KeySpaceSize() + sepLen);
+    UINT pageSize = m_Btree->ComputeIndexPageSize(m_nSortedSet + 1, KeySpaceSize() + sepLen);
     BtIndexPage* newpage = nullptr;
     HRESULT hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&newpage), MemObjectType::IndexPage);
     if (hr != S_OK) 
@@ -584,6 +648,10 @@ BTRESULT BtIndexPage::ExpandIndexPage(char* separator, UINT sepLen, BtBasePage* 
             newpage->AppendToSortedSet(separator, sepLen, leftPage);
         }
     }
+	UINT frontSize = UINT((char*)(&newpage->m_RecordArr[m_nSortedSet + 1]) - (char*)(newpage));
+	UINT backSize = newpage->KeySpaceSize();
+	_ASSERTE(frontSize + backSize == pageSize);
+
     // The entry in OldPos points to the old index page (the one that got split)
     // so we must set it to point to the corresonding new page
     newpage->GetSortedEntry(oldPos + 1)->m_RecPtr = rightPage;
@@ -607,7 +675,7 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
     // Copy first lCount records to the left new page (lowever keys)
     UINT keySpace = 0;
     for (UINT i = 0; i < lCount; i++) keySpace += GetSortedEntry(i)->m_KeyLen;
-    UINT pageSize = m_Btree->ComputePageSize(lCount, keySpace, 0);
+    UINT pageSize = m_Btree->ComputeIndexPageSize(lCount, keySpace);
 
     BtIndexPage* leftPage = nullptr;
     HRESULT hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&leftPage), MemObjectType::LeafPage);
@@ -616,25 +684,23 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
         btr = (hr == E_OUTOFMEMORY) ? BT_OUT_OF_MEMORY : BT_INTERNAL_ERROR;
         goto exit; 
     }
-
     new(leftPage)BtIndexPage(pageSize, m_Btree);
-    leftPage->m_nSortedSet = lCount;
-    UINT keyOffset = leftPage->PageSize();
+
     for (UINT i = 0; i < lCount; i++)
     {
         KeyPtrPair* pre = GetSortedEntry(i);
-        keyOffset -= pre->m_KeyLen;
-        char* dest = (char*)(leftPage)+keyOffset;
-        char* src = (char*)(this) + pre->m_KeyOffset;
-        memcpy(dest, src, pre->m_KeyLen);
-        leftPage->GetSortedEntry(i)->Set(keyOffset, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+        char* sep = (char*)(this) + pre->m_KeyOffset;
+		leftPage->AppendToSortedSet(sep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
     }
-    leftPage->m_PageStatus.m_Status.m_FirstFreeByte = keyOffset - 1;
+	UINT frontSize = UINT((char*)(&leftPage->m_RecordArr[lCount]) - (char*)(leftPage));
+	UINT backSize = leftPage->KeySpaceSize();
+	_ASSERTE(frontSize + backSize == pageSize);
+
 
     // Copy the higher rCount records into the right new page (higher keys)
     keySpace = 0;
     for (UINT i = lCount; i < m_nSortedSet; i++) keySpace += GetSortedEntry(i)->m_KeyLen;
-    pageSize = m_Btree->ComputePageSize(rCount, keySpace,0);
+    pageSize = m_Btree->ComputeIndexPageSize(rCount, keySpace);
 
     BtIndexPage* rightPage = nullptr;
     hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&rightPage), MemObjectType::LeafPage);
@@ -643,20 +709,17 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
        btr = (hr == E_OUTOFMEMORY) ? BT_OUT_OF_MEMORY : BT_INTERNAL_ERROR;
        goto exit; 
     }
-
     new(rightPage)BtIndexPage(pageSize, m_Btree);
-    rightPage->m_nSortedSet = rCount;
-    keyOffset = rightPage->PageSize();
+
     for (UINT i = lCount; i < m_nSortedSet; i++)
     {
         KeyPtrPair* pre = GetSortedEntry(i);
-        keyOffset -= pre->m_KeyLen;
-        char* dest = (char*)(rightPage)+keyOffset;
-        char* src = (char*)(this) + pre->m_KeyOffset;
-        memcpy(dest, src, pre->m_KeyLen);
-        rightPage->GetSortedEntry(i - lCount)->Set(keyOffset, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+        char* sep = (char*)(this) + pre->m_KeyOffset;
+		rightPage->AppendToSortedSet(sep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
     }
-    rightPage->m_PageStatus.m_Status.m_FirstFreeByte = keyOffset - 1;
+	frontSize = UINT((char*)(&rightPage->m_RecordArr[rCount]) - (char*)(rightPage));
+	backSize = rightPage->KeySpaceSize();
+	_ASSERTE(frontSize + backSize == pageSize);
 
      // Use the last key of the right page as separator for the two pages.
     // A separator thus indicates the highest key value allowed on a page.
@@ -664,7 +727,20 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
     char* separator = (char*)(leftPage)+leftPage->GetSortedEntry(lCount - 1)->m_KeyOffset;
     UINT seplen = leftPage->GetSortedEntry(lCount - 1)->m_KeyLen;
 
+	// Install the two new pages
+	btr = m_Btree->InstallNewPages(iter, leftPage, rightPage, separator, seplen);
+	if (btr == BT_INSTALL_FAILED)
+	{
+	  m_Btree->m_EpochMgr->Deallocate(leftPage, MemObjectType::IndexPage);
+	  m_Btree->m_EpochMgr->Deallocate(rightPage, MemObjectType::IndexPage);
+	}
+	else
+	{
+	  m_Btree->m_nPageSplits++;
+	  m_Btree->m_nIndexPages++;
+	}
     
+#ifdef DISABLED
     fprintf(stdout, "\n=== Splitting index page ========= \n");
     fprintf(stdout, "  === source: ");
     //ShortPrint(stdout);
@@ -677,15 +753,354 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
     //rightPage->ShortPrint(stdout);
     rightPage->PrintPage(stdout, iter->m_Count);
     fprintf(stdout, "\n===================================\n");
+#endif
+
+exit:
+    return btr;
+}
+
+BTRESULT BtIndexPage::TryToMergeIndexPage(BtIterator* iter)
+{
+  BTRESULT btr = BT_SUCCESS;
+
+  BtIndexPage* newPage = nullptr;
+
+  UINT myCount = 0, myKeySpace = 0;
+  UINT leftCount = 0, leftKeySpace = 0;
+  UINT rightCount = 0, rightKeySpace = 0;
+
+  BtIndexPage* parent = (BtIndexPage*)(iter->m_Path[iter->m_Count - 2].m_Page);
+  UINT mySlot = iter->m_Path[iter->m_Count - 2].m_Slot;
+
+  myCount = m_nSortedSet;
+  myKeySpace = KeySpaceSize();
+
+  BtIndexPage* leftPage = nullptr;
+  BtIndexPage* rightPage = nullptr;
+
+  if (mySlot > 0)
+  {
+	leftPage = (BtIndexPage*)(parent->GetSortedEntry(mySlot - 1)->m_RecPtr);
+	leftCount = leftPage->m_nSortedSet;
+	leftKeySpace = leftPage->KeySpaceSize();
+  }
+  if (mySlot + 1 < parent->SortedSetSize())
+  {
+	rightPage = (BtIndexPage*)(parent->GetSortedEntry(mySlot + 1)->m_RecPtr);
+	rightCount = rightPage->m_nSortedSet;
+	rightKeySpace = rightPage->KeySpaceSize();
+  }
+
+  UINT slotToDelete = 0;
+  enum mergeType { NONE, LEFT, RIGHT } mergeDir;
+  mergeDir = NONE;
+  if (leftPage && rightPage)
+  {
+	// OK to merge either way
+	mergeDir = (leftCount * sizeof(KeyPtrPair) + leftKeySpace < rightCount * sizeof(KeyPtrPair) + rightKeySpace) ? LEFT : RIGHT;
+  }
+  else
+	if (leftPage)
+	{
+	  // OK to merge left
+	  mergeDir = LEFT;
+	}
+	else
+	  if (rightPage)
+	  {
+		// OK to merge right
+		mergeDir = RIGHT;
+	  }
 
 
-    // Now install the two new pages
+  // Merge with the smaller neighbouring page
+  if (mergeDir == LEFT)
+  {
+	// Merge with left
+	UINT pageSize = m_Btree->ComputeIndexPageSize(leftCount + myCount, leftKeySpace + myKeySpace);
+	if (pageSize <= m_Btree->m_MaxPageSize)
+	{
+	  btr = MergeIndexPages(leftPage, false, &newPage);
+	  rightPage = nullptr;
+	  slotToDelete = mySlot - 1;
+	}
+
+  }
+  else
+	if (mergeDir == RIGHT)
+	{
+	  // Merge with right
+	  UINT pageSize = m_Btree->ComputeLeafPageSize(rightCount + myCount, rightKeySpace + myKeySpace, 0);
+	  if (pageSize <= m_Btree->m_MaxPageSize)
+	  {
+		btr = MergeIndexPages(rightPage, true, &newPage);
+		leftPage = nullptr;
+		slotToDelete = mySlot;
+	  }
+	}
+	else
+	{
+	  leftPage = nullptr;
+	  rightPage = nullptr;
+	  newPage = nullptr;
+	  btr = BT_NO_MERGE;
+	}
+
+  BtIndexPage* newParent = nullptr;
+  if (newPage)
+  {
+
+	// Create new parent index page
+
+	parent->ShrinkIndexPage(slotToDelete, newParent);
+	KeyPtrPair* myNewEntry = newParent->GetSortedEntry(slotToDelete);
+	myNewEntry->m_RecPtr = newPage;
+
+	// Determine where to install the new page
+	BtBasePage** installAddr = nullptr;
+	int parentIndx = iter->m_Count - 2;
+	_ASSERTE(parentIndx >= 0);
+
+	if (parentIndx == 0)
+	{
+	  // The b-tree object is the grandparent
+	  installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
+	}
+	else
+	{
+	  BtIndexPage* grandParentPage = (BtIndexPage*)(iter->m_Path[parentIndx - 1].m_Page);
+	  KeyPtrPair* recEntry = grandParentPage->GetSortedEntry(iter->m_Path[parentIndx - 1].m_Slot);
+	  installAddr = (BtBasePage**)(&recEntry->m_RecPtr);
+	}
+
+	LONG64 oldval = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParent), LONG64(parent));
+	if (oldval != LONG64(parent))
+	{
+	  btr = BT_INSTALL_FAILED;
+	  goto exit;
+	}
+	InterlockedIncrement(&m_Btree->m_nPageMerges);
+  }
+
+
+exit:
+  if (btr != BT_SUCCESS)
+  {
+	if (newPage) m_Btree->m_MemoryBroker->DeallocateNow(newPage, MemObjectType::IndexPage);
+	newPage = nullptr;
+	if (newParent) m_Btree->m_MemoryBroker->DeallocateNow(newParent, MemObjectType::IndexPage);
+	newParent = nullptr;
+  }
+  else
+  {
+	if (leftPage)  m_Btree->m_MemoryBroker->Free(leftPage, MemObjectType::IndexPage);
+	if (rightPage) m_Btree->m_MemoryBroker->Free(rightPage, MemObjectType::LeafPage);
+	InterlockedDecrement(&m_Btree->m_nIndexPages);
+	newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::IndexPage);
+  }
+
+  return btr;
+
+}
+
+
+BTRESULT BtIndexPage::MergeIndexPages(BtIndexPage* otherPage, bool mergeOnRight, BtIndexPage** newPage)
+{
+
+  BTRESULT btr = BT_SUCCESS;
+
+  BtIndexPage* leftPage = nullptr;
+  BtIndexPage* rightPage = nullptr;
+  BtIndexPage* newIndexPage = nullptr;
+  *newPage = nullptr;
+
+  if (mergeOnRight)
+  {
+	leftPage = this;
+	rightPage = otherPage;
+  }else
+  {
+	leftPage = otherPage;
+	rightPage = this;
+  }
+
+  UINT keySpace = leftPage->KeySpaceSize() + rightPage->KeySpaceSize();
+  UINT recCount = leftPage->LiveRecordCount() + rightPage->LiveRecordCount();
+  UINT pageSize = m_Btree->ComputeLeafPageSize(recCount, keySpace, 0);
+  HRESULT hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&newIndexPage), MemObjectType::IndexPage);
+  if (hr != S_OK)
+  {
+	btr = BT_OUT_OF_MEMORY;
+	goto exit;
+  }
+  new(newIndexPage)BtIndexPage(pageSize, m_Btree);
+
+  // Insert the records into the new page
+  for (UINT i = 0; i < leftPage->m_nSortedSet; i++)
+  {
+	KeyPtrPair* pre = leftPage->GetSortedEntry(i);
+	char* key = (char*)(leftPage) + pre->m_KeyOffset;
+	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+  }
+  for (UINT i = 0; i < rightPage->m_nSortedSet; i++)
+  {
+	KeyPtrPair* pre = rightPage->GetSortedEntry(i);
+	char* key = (char*)(rightPage) + pre->m_KeyOffset;
+	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+  }
+  *newPage = newIndexPage;
+
+exit:
+
+  if (btr != BT_SUCCESS)
+  {
+	if (newIndexPage) m_Btree->m_MemoryBroker->DeallocateNow(newIndexPage, MemObjectType::LeafPage);
+	newIndexPage = nullptr;
+  }
+
+  return btr;
+}
+
+BTRESULT BtIndexPage::ShrinkIndexPage(UINT dropPos, BtIndexPage*& newIndexPage)
+{
+  BTRESULT btr = BT_SUCCESS;
+  BtIndexPage* newpage = nullptr;
+
+  if (m_nSortedSet <= 1)
+  {
+	goto exit;
+  }
+
+  _ASSERTE(dropPos < m_nSortedSet);
+  UINT sepLen = m_RecordArr[dropPos].m_KeyLen;
+  UINT pageSize = m_Btree->ComputeIndexPageSize(m_nSortedSet -1, KeySpaceSize() - sepLen);
+
+  HRESULT hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&newpage), MemObjectType::IndexPage);
+  if (hr != S_OK)
+  {
+	btr = (hr == E_OUTOFMEMORY) ? BT_OUT_OF_MEMORY : BT_INTERNAL_ERROR;
+	goto exit;
+  }
+  new(newpage)BtIndexPage(pageSize, m_Btree);
+
+  if (newpage->m_PageSize < m_Btree->m_MinPageSize)
+  {
+	newpage->m_PageStatus.m_Status.m_PageState = MERGE_PAGE;
+  }
+ 
+
+  char* curSep = nullptr;
+  UINT curSepLen = 0;
+  KeyPtrPair* pre = nullptr;
+
+  UINT tpos = 0;
+  for (UINT spos = 0; spos < m_nSortedSet; spos++)
+  {
+	if (spos != dropPos)
+	{
+	  pre = GetSortedEntry(spos);
+	  curSep = (char*)(this) + pre->m_KeyOffset;
+	  newpage->AppendToSortedSet(curSep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	}
+	tpos++;
+  }
+
+  UINT frontSize = UINT((char*)(&newpage->m_RecordArr[m_nSortedSet-1]) - (char*)(newpage));
+  UINT backSize = newpage->KeySpaceSize();
+  _ASSERTE(frontSize + backSize == pageSize);
+
+exit:
+  newIndexPage = newpage;
+  return btr;
+
+}
+
+
+void BtBasePage::DeletePage(BtIterator* iter)
+{
+  // Check the index pages on the path up to the root looking for the first page that
+  // conatins more then one record entry. This page will be updated and all index pages 
+  // below it will be deleted because they will become empty. 
+  const UINT MAXPAGES2DELETE = 10;
+  BtIndexPage* pages2Delete[MAXPAGES2DELETE];
+  UINT deleteCount = 0;
+
+  BtIndexPage* parentPage = nullptr;
+  int parentIndx = 0;
+  for (parentIndx = iter->m_Count - 2; parentIndx >= 0; parentIndx--)
+  {
+	parentPage = (BtIndexPage*)(iter->m_Path[parentIndx].m_Page);
+	if (parentPage->LiveRecordCount() > 1)
+	{
+	  break;
+	}
+	pages2Delete[deleteCount] = parentPage;
+	deleteCount++;
+  }
+
+  // Create a new instance of the parent page without the separator and pointer
+  // for the current page. Then update the pointer in the grandparent page or b-tree object
+  UINT dropPos = iter->m_Path[parentIndx].m_Slot;
+  BtIndexPage* newIndxPage = nullptr;
+  BTRESULT hr = BT_SUCCESS;
+  if (parentPage)
+  {
+	parentPage->ShrinkIndexPage(dropPos, newIndxPage);
+  }
+ 
+  // Determine where to install the new page
+  BtBasePage** installAddr = nullptr;
+  if (parentIndx == -1)
+  {
+	// Deleting the last page of the tree so set then root pointer to null.
+	_ASSERTE(newIndxPage == nullptr);
+	installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
+  }  else
+  if (parentIndx == 0)
+  {
+	// The b-tree object is the grandparent
+	installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
+  }
+  else
+  {
+	BtIndexPage* grandParentPage = (BtIndexPage*)(iter->m_Path[parentIndx-1].m_Page);
+	KeyPtrPair* recEntry = grandParentPage->GetSortedEntry(iter->m_Path[parentIndx-1].m_Slot);
+	installAddr = (BtBasePage**)(&recEntry->m_RecPtr);
+  }
+  *installAddr = newIndxPage;
+  // TODO Make installation atomic...
+
+  // Delete index pages that are no longer needed.
+  for (UINT i = 0; i < deleteCount; i++)
+  {
+	BtIndexPage* pg = pages2Delete[i];
+	m_Btree->m_EpochMgr->Deallocate(pg, MemObjectType::IndexPage);
+    m_Btree->m_nIndexPages--;
+  }
+  // Finally delete the current leaf page
+  m_Btree->m_nLeafPages--;
+  m_Btree->m_EpochMgr->Deallocate(this, MemObjectType::IndexPage);
+
+
+}
+
+BTRESULT BtreeRootInternal::InstallNewPages(BtIterator* iter, BtBasePage* leftPage, BtBasePage* rightPage, char* separator, UINT sepLen)
+{
+  UINT addedIndexPages = 0;
+  BtIndexPage* newParentPage = nullptr;
+  BtIndexPage* parentPage = nullptr;
+  BtBasePage* expVal = nullptr;
+  BtBasePage** installAddr = nullptr;
+  BTRESULT btr = BT_SUCCESS;
+
+  // Install the two new pages
     if (iter->m_Count == 1)
     {
-        // Btree object is the parent so update there
-        BtIndexPage* indxPage = m_Btree->CreateIndexPage(leftPage, rightPage, separator, seplen);
-        m_Btree->m_RootPage = indxPage;
-        m_Btree->m_nIndexPages++;
+	// B-tree object is the parent so update there
+	newParentPage = CreateIndexPage(leftPage, rightPage, separator, sepLen);
+	expVal = const_cast<BtBasePage*>(m_RootPage);
+	installAddr = const_cast<BtBasePage**>(&(m_RootPage));
+	addedIndexPages++;
         fprintf(stdout, "==== New root page ======\n");
         indxPage->PrintPage(stdout, 1);
     }
@@ -693,16 +1108,15 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
     {
         // Create a new instance of the parent index page that includes the new separator 
         // and the two new pages. Then update the pointer in the grandparent page.
-        BtIndexPage* parentPage = (BtIndexPage*)(iter->m_Path[iter->m_Count - 2].m_Page);
+	parentPage = (BtIndexPage*)(iter->m_Path[iter->m_Count - 2].m_Page);
         UINT oldPos = iter->m_Path[iter->m_Count - 2].m_Slot;
-        BtIndexPage* newIndxPage = nullptr;
-        hr = parentPage->ExpandIndexPage(separator, seplen, leftPage, rightPage, oldPos, newIndxPage);
 
-        BtBasePage** installAddr = nullptr;
+	HRESULT hr = parentPage->ExpandIndexPage(separator, sepLen, leftPage, rightPage, oldPos, newParentPage);
+
         if (iter->m_Count == 2)
         {
             // The b-tree object is the grandparent
-            installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
+	  installAddr = const_cast<BtBasePage**>(&m_RootPage);
             fprintf(stdout, "====== New root page ======\n");
             newIndxPage->PrintPage(stdout, 1);
         }
@@ -712,13 +1126,23 @@ BTRESULT BtIndexPage::SplitIndexPage(BtIterator* iter)
             KeyPtrPair* recEntry = grandParentPage->GetSortedEntry(iter->m_Path[iter->m_Count - 3].m_Slot);
             installAddr = (BtBasePage**)(&recEntry->m_RecPtr);
         }
-        *installAddr = newIndxPage;
-        m_Btree->m_EpochMgr->Deallocate(parentPage, MemObjectType::IndexPage); 
-        m_Btree->m_nIndexPages++;
+	expVal = parentPage;
     }
 
+  LONG64 oldVal = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParentPage), LONG64(expVal));
+  if (oldVal == LONG64(expVal))
+  {
+	// Success so delete the old parent page (if there was one)
+	if( parentPage) m_EpochMgr->Deallocate(parentPage, MemObjectType::IndexPage);
+	m_nIndexPages += addedIndexPages;
+  }
+  else
+  {
+	// Failure so delete the new index page
+	m_EpochMgr->DeallocateNow(newParentPage, MemObjectType::IndexPage);
+	btr = BT_INSTALL_FAILED;
+  }
 
-exit:
     return btr;
 }
 
@@ -753,6 +1177,48 @@ BTRESULT BtreeRoot::DeleteRecord(KeyType* key)
     BtreeRootInternal* btreeInt = (BtreeRootInternal*)(this);
     return btreeInt->DeleteRecordInternal(key);
 }
+
+void BtreeRoot::PrintStats(FILE* file)
+{
+  BtreeRootInternal* root = (BtreeRootInternal*)(this);
+  root->PrintTreeStats(file);
+}
+
+void BtreeRoot::CheckTree(FILE* fh)
+{
+	BtreeRootInternal* btreeInt = (BtreeRootInternal*)(this);
+    return btreeInt->CheckTree(fh);
+}
+
+BtreeRootInternal::BtreeRootInternal()
+{
+  m_MemoryBroker = new MemoryBroker(m_MemoryAllocator);
+  m_EpochMgr = new EpochManager();
+  m_EpochMgr->Initialize(m_MemoryBroker, this, nullptr);
+  m_RootPage = nullptr;
+  m_nInserts = m_nDeletes = m_nUpdates = 0;
+  m_nRecords = m_nLeafPages = m_nIndexPages = 0;
+  m_nPageSplits = m_nConsolidations = m_nPageMerges = 0;
+}
+
+// Compute the page size to allocate
+UINT BtreeRootInternal::ComputeLeafPageSize(UINT nrRecords, UINT keySpace, UINT minFree)
+{
+  UINT frontSpace = BtLeafPage::LeafPageHeaderSize();
+  UINT minKeySpace = nrRecords * sizeof(KeyPtrPair) + keySpace;
+  UINT freeSpace = max(minFree, UINT(minKeySpace*m_FreeSpaceFraction));
+
+  UINT pageSize = frontSpace + minKeySpace + freeSpace;
+  return pageSize;
+}
+
+UINT BtreeRootInternal::ComputeIndexPageSize(UINT fanout, UINT keySpace)
+{
+  UINT frontSize = BtIndexPage::IndexPageHeaderSize();
+  INT  pageSize = frontSize + fanout * sizeof(KeyPtrPair) + keySpace;
+  return pageSize;
+}
+
 
 // Find the path down to the target leaf page and store it in iter.
 // The function does not include closed or closing pages in the path.
@@ -792,7 +1258,16 @@ tryagain:
                 m_nPageSplits++;
             }
             goto tryagain;
+        } else
+		if (indxPage->m_PageStatus.m_Status.m_PageState == MERGE_PAGE && iter->m_Count > 1)
+		{
+		  // Try to merge this page with its left or right neighbour
+		  BTRESULT hr = indxPage->TryToMergeIndexPage(iter);
+		  if (hr == BT_SUCCESS)
+		  {
+			goto tryagain;
         }
+		}
  
         curPage = (BtBasePage*)(indxPage->GetSortedEntry(slot)->m_RecPtr);
     }
@@ -826,7 +1301,7 @@ tryagain:
     // Create a new root page if there isn't one already
     while (rootbase == nullptr)
     {
-        BtBasePage* page = CreateEmptyPage();
+        BtBasePage* page = CreateEmptyLeafPage();
         if (!page)
         {
             btr = BT_OUT_OF_MEMORY;
@@ -839,6 +1314,7 @@ tryagain:
             m_EpochMgr->DeallocateNow(page, MemObjectType::LeafPage);
         }
         rootbase = const_cast<BtBasePage*>(m_RootPage);
+		m_nLeafPages++;
     }
 
 
@@ -851,18 +1327,16 @@ tryagain:
      if (btr == BT_SUCCESS) 
      {
          m_nRecords++;
+		 m_nInserts++;
          goto exit; 
      }
 
     // Page is full so either enlarge and consolidate it or split it
     // Try consolidation first 
      BtLeafPage* newPage = nullptr;
-     btr = leafPage->ConsolidateLeafPage(newPage, &iter, key->m_KeyLen+sizeof(KeyPtrPair) );
+     btr = leafPage->ConsolidateLeafPage(&iter, key->m_KeyLen+sizeof(KeyPtrPair) );
      if (btr == BT_SUCCESS)
      {
-        m_EpochMgr->Deallocate(leafPage, MemObjectType::LeafPage);
-        m_nConsolidations++;
-        CheckTree(stdout); 
         goto tryagain;
      }
 
@@ -872,7 +1346,6 @@ tryagain:
     {
         m_EpochMgr->Deallocate(leafPage, MemObjectType::LeafPage);
         m_nPageSplits++;
-        CheckTree(stdout); 
         goto tryagain;   
     }
 
@@ -897,30 +1370,29 @@ BTRESULT BtreeRootInternal::DeleteRecordInternal(KeyType* key)
     btr = leafPage->DeleteRecordFromPage(key);
     if (btr == BT_SUCCESS)
     {
-        if (leafPage->m_PageSize > m_MinPageSize && leafPage->m_WastedSpace > leafPage->m_PageSize*m_FreeSpaceFraction)
+	InterlockedDecrement(&m_nRecords);
+	m_nDeletes++;
+
+	if (leafPage->LiveRecordCount() == 0)
         {
-            BtLeafPage* newPage = nullptr;
-            btr = leafPage->ConsolidateLeafPage(newPage, &iter, 0);
-            if (btr == BT_SUCCESS)
+	  leafPage->DeletePage(&iter);
+	}
+	else
+	  if (leafPage->m_PageSize > m_MinPageSize && leafPage->m_WastedSpace > leafPage->NetPageSize()*m_FreeSpaceFraction)
             {
-                m_EpochMgr->Deallocate(leafPage, MemObjectType::LeafPage);
-                m_nConsolidations++;
-                CheckTree(stdout);
+		// Try to consolidate the page
+		btr = leafPage->ConsolidateLeafPage(&iter, 0);
+
             }
-        } else
+	  else
         if (leafPage->m_PageSize <= m_MinPageSize)
         {
             //Try to merge page with left or right neighbor
+		  leafPage->TryToMergeLeafPage(&iter);
         }
-        if (leafPage->LiveRecordCount() == 0)
-        {
-            //DeleteLeafPage(leafPage, &iter);
+	// leafPage may have been deleted so no more references to it after this
         }
-        m_nRecords--;
-        goto exit;
-    }
 
-exit:
     m_EpochMgr->ExitEpoch(epochId);
     return btr;
 }
@@ -966,6 +1438,69 @@ exit:
     return btr;
 }
 
+void BtreeRootInternal::Print(FILE* file)
+{
+  BtBasePage* rootPage = const_cast<BtBasePage*>(m_RootPage);
+  if (rootPage)
+  {
+	if (rootPage->IsIndexPage())
+	{
+	  ((BtIndexPage*)(rootPage))->PrintPage(file, 1);
+	}
+	else
+	{
+	  ((BtLeafPage*)(rootPage))->PrintPage(file, 1);
+	}
+  }
+  else
+  {
+	fprintf(file, "B-tree is empty\n");
+  }
+}
+
+void BtreeRootInternal::ComputeTreeStats(BtreeStatistics* statsp)
+{
+  BtBasePage* rootPage = const_cast<BtBasePage*>(m_RootPage);
+  if (rootPage)
+  {
+	if (rootPage->IsIndexPage())
+	{
+	  BtIndexPage* ip = (BtIndexPage*)(rootPage);
+	  ip->ComputeTreeStats(statsp);
+	}
+	else
+	{
+	  BtLeafPage* lp = (BtLeafPage*)(rootPage);
+	  lp->ComputeTreeStats(statsp);
+	}
+  }
+}
+
+void BtreeRootInternal::PrintTreeStats(FILE* file)
+{
+  BtreeStatistics stats;
+  stats.Clear();
+  ComputeTreeStats(&stats);
+
+  fprintf(file, "\n=========== B-tree statistics ===============\n");
+  fprintf(file, "Size: %d records, %d leaf pages, %d index pages\n",
+				m_nRecords, m_nLeafPages, m_nIndexPages);
+  fprintf(file, "Operations: %d inserts, %d deletes\n", m_nInserts, m_nDeletes);
+  fprintf(file, "Page ops: %d consolidations, %d splits, %d merges\n", m_nConsolidations, m_nPageSplits, m_nPageMerges);
+
+  fprintf(file, "Index pages\n");
+  fprintf(file, "   Space: %d alloced, %d pages\n", stats.m_AllocedSpaceIP, stats.m_SpaceIP );
+  fprintf(file, "   Space usage: %d headers, %d rec arrays, %d keys\n", stats.m_HeaderSpaceIP, stats.m_RecArrSpaceIP, stats.m_KeySpaceIP);
+
+  fprintf(file, "Leaf pages\n");
+  fprintf(file, "   Space: %d alloced, %d pages\n", stats.m_AllocedSpaceLP, stats.m_SpaceLP);
+  fprintf(file, "   Space usage: %d headers, %d rec arrays, %d keys, %d free, %d deleted\n", 
+	                stats.m_HeaderSpaceLP, stats.m_RecArrSpaceLP, stats.m_KeySpaceLP,
+	                stats.m_FreeSpaceLP, stats.m_DeletedSpaceLP);
+
+  fprintf(file, "=============================================\n");
+}
+
 void BtreeRootInternal::CheckTree(FILE* file)
 {
     //fprintf(file, " ====== Checking tree =======\n");
@@ -979,7 +1514,14 @@ void BtreeRootInternal::CheckTree(FILE* file)
     UINT errorCount = 0;
     if (rootPage)
     {
-        errorCount = rootPage->CheckPage(file, &lowbound, &hibound);
+	  if (rootPage->IsIndexPage())
+	  {
+		errorCount = ((BtIndexPage*)(rootPage))->CheckPage(file, &lowbound, &hibound);
+    }
+	  else
+	  {
+		errorCount = ((BtLeafPage*)(rootPage))->CheckPage(file, &lowbound, &hibound);
+	   }
     }
     if (errorCount > 0)
     {
@@ -1012,7 +1554,7 @@ tryagain:
     // Reserve space for the new record
     newState.m_Status64 = pst.m_Status64;
     newState.m_Status.m_nUnsortedReserved++;
-    newState.m_Status.m_FirstFreeByte -= key->m_KeyLen;
+    newState.m_Status.m_LastFreeByte -= key->m_KeyLen;
     LONG64 oldval = InterlockedCompareExchange64((LONG64*)(&m_PageStatus.m_Status64), newState.m_Status64, pst.m_Status64);
     if (oldval != pst.m_Status64)
     {
@@ -1021,13 +1563,13 @@ tryagain:
  
  
   // First copy the key into its reserved space
-  char* keyBuffer = (char*)(this) + newState.m_Status.m_FirstFreeByte + 1;
+  char* keyBuffer = (char*)(this) + newState.m_Status.m_LastFreeByte + 1;
   memcpy(keyBuffer, key->m_pKeyValue, key->m_KeyLen);
 
   // Then fill in the record slot
   UINT32 slotIndx = newState.m_Status.m_nUnsortedReserved - 1;
   KeyPtrPair* pentry = GetUnsortedEntry(slotIndx); 
-  pentry->m_KeyOffset = newState.m_Status.m_FirstFreeByte + 1;
+  pentry->m_KeyOffset = newState.m_Status.m_LastFreeByte + 1;
   pentry->m_KeyLen = key->m_KeyLen;
   MemoryBarrier();
 
@@ -1140,16 +1682,37 @@ exit:
 
 }
 
+UINT BtLeafPage::AppendToSortedSet(char* key, UINT keyLen, void* ptr)
+{
+  _ASSERTE(UnusedSpace() >= keyLen + sizeof(KeyPtrPair));
+  m_PageStatus.m_Status.m_LastFreeByte -= keyLen;
+  char* dst = (char*)(this) + m_PageStatus.m_Status.m_LastFreeByte + 1;
+  memcpy_s(dst, keyLen, key, keyLen);
+
+  m_nSortedSet++;
+  KeyPtrPair* pre = GetSortedEntry(m_nSortedSet - 1);
+  pre->Set(m_PageStatus.m_Status.m_LastFreeByte + 1, keyLen, ptr);
+
+  return m_nSortedSet;
+}
+
+
 
 bool BtLeafPage::EnoughFreeSpace(UINT32 keylen, UINT64 pageState)
 {
   PageStatusUnion pst;
   pst.m_Status64 = pageState;
 
-  UINT reqSpace = sizeof(KeyPtrPair) + keylen;
-  UINT arrSpace = (m_nSortedSet + pst.m_Status.m_nUnsortedReserved) * sizeof(KeyPtrPair);
-  UINT keySpace = m_PageSize - pst.m_Status.m_FirstFreeByte;
-  UINT freeSpace = m_PageSize - PageHeaderSize() - arrSpace - keySpace;  
+  // First free byte (from beginning of the page
+  UINT  slotsUsed = m_nSortedSet + pst.m_Status.m_nUnsortedReserved;
+  char* firstFree = (char*)(&m_RecordArr[slotsUsed]);
+
+  char* lastFree = (char*)(this) + pst.m_Status.m_LastFreeByte;
+
+  INT64 freeSpace = lastFree - firstFree + 1;
+  _ASSERTE(freeSpace >= 0);
+
+  INT64 reqSpace = sizeof(KeyPtrPair) + keylen;
 
   return reqSpace <= freeSpace;
 }
@@ -1227,28 +1790,32 @@ void BtLeafPage::ClosePage()
 
 }
 
-BTRESULT BtLeafPage::ConsolidateLeafPage(BtLeafPage*& newpage, BtIterator* iter, UINT minFree)
+// Get a consistent count of the number of live records and the key space they require
+void BtBasePage::LiveRecordSpace(UINT& recCount, UINT& keySpace)
 {
-tryagain:
+  PageStatusUnion pst;
 
-    // Get a stable copy of the page status
-    PageStatusUnion pst;
+  do
+  {
     pst.m_Status64 = m_PageStatus.m_Status64;
 
-    newpage = nullptr;
-    KeyPtrPair* sortArr = nullptr;
+	if (IsIndexPage())
+	{
+	  recCount = m_nSortedSet;
+	  keySpace = KeySpaceSize();
+	}
+	else
+	{
 
-    BTRESULT btr = BT_SUCCESS;
-    BtLeafPage* newPage = nullptr;
-
+	  BtLeafPage* page = (BtLeafPage*)(this);
 
     // Count the number of records remaining on the page and the amount of space needed for the new page
-    UINT recCount = 0;
-    UINT keySpace = 0;
+	  recCount = 0;
+	  keySpace = 0;
     KeyPtrPair* pre = nullptr;
-    for (UINT i = 0; i < m_nSortedSet; i++)
+	  for (UINT i = 0; i < m_nSortedSet + pst.m_Status.m_nUnsortedReserved ; i++)
     {
-        pre = GetKeyPtrPair(i);
+		pre = page->GetKeyPtrPair(i);
         if (pre->m_RecPtr)
         {
             recCount++;
@@ -1256,70 +1823,171 @@ tryagain:
         }
     }
 
-    UINT nrUnsorted = 0;
-    for (UINT i = 0; i < pst.m_Status.m_nUnsortedReserved; i++)
+	}
+	
+	// Try again if page status has changed. 
+  } while (pst.m_Status64 != m_PageStatus.m_Status64);
+
+}
+
+BTRESULT BtLeafPage::ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, UINT& keySpace)
     {
-        pre = GetUnsortedEntry(i);
-        if (pre->m_RecPtr)
+  _ASSERTE(IsClosed());
+  BTRESULT btr = BT_SUCCESS;
+
+  // Allocate array for final result
+  UINT liveRecs = LiveRecordCount();
+  liveRecArray = nullptr;
+  count = 0;
+  keySpace = 0;
+  HRESULT hr = m_Btree->m_MemoryBroker->Allocate(liveRecs*sizeof(KeyPtrPair), (void**)(&liveRecArray), MemObjectType::TmpPointerArray);
+  if (hr != S_OK)
         {
+	btr = BT_OUT_OF_MEMORY;
+	goto exit;
+  }
+  // Copy in the the live records from the sorted set
+  UINT recCount = 0;
+  for (UINT i = 0; i < m_nSortedSet; i++)
+  {
+	KeyPtrPair* pre = &m_RecordArr[i];
+	if (!pre->IsDeleted())
+	{
+	  liveRecArray[recCount] = *pre;
             recCount++;
             keySpace += pre->m_KeyLen;
-            nrUnsorted++;
         }
     }
 
-    UINT newSize = m_Btree->ComputePageSize(recCount, keySpace, minFree);
-
-    // Don't expand beyond maximum page size
-    if (newSize > m_Btree->m_MaxPageSize)
+  // Copy the unsorted record entries into an array and sort them
+  //
+  KeyPtrPair* sortArr = nullptr;
+  UINT nrUnsorted = m_PageStatus.m_Status.m_nUnsortedReserved;
+  UINT srcCount = 0;
+  if (nrUnsorted > 0)
     {
-        btr = BT_MAX_SIZE;
+	HRESULT hr = m_Btree->m_MemoryBroker->Allocate(nrUnsorted * sizeof(KeyPtrPair), (void**)(&sortArr), MemObjectType::TmpPointerArray);
+	if (hr != S_OK)
+	{
+	  btr = BT_OUT_OF_MEMORY;
         goto exit;
     }
 
-    if (pst.m_Status64 != m_PageStatus.m_Status64)
+	KeyPtrPair* pre = nullptr;
+	for (UINT i = 0; i < nrUnsorted; i++)
     {
-        goto tryagain;
+	  pre = GetUnsortedEntry(i);
+	  if (pre->m_RecPtr != nullptr)
+	  {
+		sortArr[srcCount] = *pre;
+		srcCount++;
     }
-    ClosePage();
-    _ASSERTE(m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);
+	}
+	btr = SortUnsortedSet(sortArr, srcCount);
+  }
  
+  // Now merge the newly sorted records into liveRecArray.
+  // The numberof records in sortArr is typically much smaller
+  // then the number of records in liveRecArray.
 
-    // Allocate the new page
-    HRESULT hr = m_Btree->m_MemoryBroker->Allocate(newSize, (void**)(&newPage), MemObjectType::LeafPage);
-    if (hr != S_OK)
+  if (srcCount > 0)
     {
-        btr = BT_OUT_OF_MEMORY;
-        goto exit;
-    }
-    new(newPage) BtLeafPage(newSize, m_Btree);
-    newPage->m_nSortedSet = recCount;
+	int trgtIndx = recCount + srcCount -1;
+	int liveIndx = recCount - 1;
+	int recsCopied = 0;
+	for (int srcIndx = srcCount - 1; srcIndx >= 0; srcIndx--)
+	{
+	  char* srcKey = (char*)(this) + sortArr[srcIndx].m_KeyOffset;
+	  UINT  srcKeyLen = sortArr[srcIndx].m_KeyLen;
 
+	  // Advance until we find a record with a key less than or equal to the srcKey
+	  for (; liveIndx >= 0; liveIndx--)
+	  {
+		char* liveKey = (char*)(this) + liveRecArray[liveIndx].m_KeyOffset;
+		UINT liveKeyLen = liveRecArray[liveIndx].m_KeyLen;
+		
+		// Copy larger key into the target position
+		recsCopied++;
+		int cv = m_Btree->m_CompareFn(liveKey, liveKeyLen, srcKey, srcKeyLen);
+		if (cv <= 0)
+		{
+		  // Copy from srcIndx into target position
+		  liveRecArray[trgtIndx] = sortArr[srcIndx];
+		  trgtIndx++;
+		  break;
+    }
+		// Copy  from liveIndx into target poisition
+		liveRecArray[trgtIndx] = liveRecArray[liveIndx];
+		trgtIndx++;
+	  }
+	}
+  }
+  count = recCount + srcCount;
+
+  for (UINT i = 0; i < count; i++)
+  {
+	KeyPtrPair* pre = &liveRecArray[i];
+	pre->CleanEntry();
+	_ASSERTE(!pre->IsDeleted());
+  }
+
+exit:
+  if (btr != BT_SUCCESS)
+  {
+	if (liveRecArray)
+	{
+	  m_Btree->m_MemoryBroker->DeallocateNow(liveRecArray, MemObjectType::TmpPointerArray);
+	  liveRecArray = nullptr;
+	  count = 0;
+	}
+  }
+  return btr;
+}
+
+BTRESULT BtLeafPage::CopyToNewPage(BtLeafPage* newPage)
+{
+  PageStatusUnion pst;
+  pst.m_Status64 = m_PageStatus.m_Status64;
+
+  KeyPtrPair* sortArr = nullptr;
+  BTRESULT btr = BT_SUCCESS;
+  
     // Copy the unsorted record entries into an array and sort them
-    hr = m_Btree->m_MemoryBroker->Allocate(nrUnsorted*sizeof(KeyPtrPair), (void**)(&sortArr), MemObjectType::TmpPointerArray);
+  //
+  UINT nrUnsorted = pst.m_Status.m_nUnsortedReserved;
+  UINT rCount = 0; 
+  if (nrUnsorted > 0)
+  {
+	HRESULT hr = m_Btree->m_MemoryBroker->Allocate(nrUnsorted * sizeof(KeyPtrPair), (void**)(&sortArr), MemObjectType::TmpPointerArray);
     if (hr != S_OK)
     {
         btr = BT_OUT_OF_MEMORY;
         goto exit;
     }
 
+
+	KeyPtrPair* pre = nullptr;
     for (UINT i = 0; i < nrUnsorted; i++)
     {
         pre = GetUnsortedEntry(i);
-        sortArr[i] = *pre;
+	  if (pre->m_RecPtr != nullptr)
+	  {
+		sortArr[rCount] = *pre;
+		rCount++;
     }
-    btr = SortUnsortedSet(sortArr, nrUnsorted);
-
-
-    UINT32 keyOffset = newSize - 1;
+	}
+	btr = SortUnsortedSet(sortArr, rCount);
+  }
 
     // Merge the record entries from the sorted set on the input page
     // and the record entries from the sort array to create the sorted set of the new page
     KeyPtrPair* pLeft = GetKeyPtrPair(0);
-    KeyPtrPair* pRight = &sortArr[0];
-    KeyPtrPair* pTarget = newPage->GetKeyPtrPair(0);
+  KeyPtrPair* pRight = (KeyPtrPair*)(sortArr);
     INT lCount = m_nSortedSet;
-    INT rCount = nrUnsorted;
+
+  UINT copiedRecs = 0;
+  UINT copiedSpace = 0;
+
 
     while (lCount > 0 && rCount > 0)
     {
@@ -1338,30 +2006,23 @@ tryagain:
         if (cv <= 0)
         {
             // Copy record entry and key value from left input
-            keyOffset -= pLeft->m_KeyLen;
-            char* keyAddr = (char*)(newPage)+keyOffset;
-            memcpy(keyAddr, lKey, pLeft->m_KeyLen);
+	  newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
+	  copiedRecs++;
+	  copiedSpace += pLeft->m_KeyLen;
 
-            // Update target entry
-            pTarget->Set(keyOffset, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
-
-            // Advance left inputf and target
-            pTarget++;
+	  // Advance left input
             pLeft++;
             lCount--;
         }
         else
         {
             // Copy record entry and key value from left input
-            keyOffset -= pRight->m_KeyLen;
-            char* keyAddr = (char*)(newPage)+keyOffset;
-            memcpy(keyAddr, rKey, pRight->m_KeyLen);
+	  newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
 
-            // Update target entry
-            pTarget->Set(keyOffset, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
+	  copiedRecs++;
+	  copiedSpace += pRight->m_KeyLen;
 
-            // Advance left inputf and target
-            pTarget++;
+	  // Advance right input
             pRight++;
             rCount--;
         }
@@ -1370,17 +2031,20 @@ tryagain:
     // Copy remaining, if any, from left or right
     while (lCount > 0)
     {
+	if (pLeft->m_RecPtr == nullptr)
+	{
+	  pLeft++;
+	  lCount--;
+	  continue;
+	}
+
         // Copy record entry and key value from left input
         char* lKey = (char*)(this) + pLeft->m_KeyOffset;
-        keyOffset -= pLeft->m_KeyLen;
-        char* keyAddr = (char*)(newPage)+keyOffset;
-        memcpy(keyAddr, lKey, pLeft->m_KeyLen);
+	newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
+	copiedRecs++;
+	copiedSpace += pLeft->m_KeyLen;
 
-        // Update target entry
-        pTarget->Set(keyOffset, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
-
-        // Advance left inputf and target
-        pTarget++;
+	// Advance left input
         pLeft++;
         lCount--;
     }
@@ -1389,24 +2053,70 @@ tryagain:
     {
         // Copy record entry and key value from right input
         char* rKey = (char*)(this) + pRight->m_KeyOffset;
-        keyOffset -= pRight->m_KeyLen;
-        char* keyAddr = (char*)(newPage)+keyOffset;
-        memcpy(keyAddr, rKey, pRight->m_KeyLen);
+	newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
+	copiedRecs++;
+	copiedSpace += pRight->m_KeyLen;
 
-        // Update target entry
-        pTarget->Set(keyOffset, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
-
-        // Advance left inputf and target
-        pTarget++;
+	// Advance right input
         pRight++;
         rCount--;
     }
-    newPage->m_PageStatus.m_Status.m_FirstFreeByte = keyOffset - 1;
 
     for (UINT i = 0; i < newPage->m_nSortedSet; i++)
     {
         newPage->m_RecordArr[i].CleanEntry();
     }
+
+exit:
+  return btr;
+}
+
+BTRESULT BtLeafPage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
+{
+
+    // Get a stable copy of the page status
+    PageStatusUnion pst;
+    pst.m_Status64 = m_PageStatus.m_Status64;
+
+    BTRESULT btr = BT_SUCCESS;
+    BtLeafPage* newPage = nullptr;
+
+
+    UINT recCount = 0;
+    UINT keySpace = 0;	
+	LiveRecordSpace(recCount, keySpace);
+
+    UINT newSize = m_Btree->ComputeLeafPageSize(recCount, keySpace, minFree);
+
+    // Don't expand beyond maximum page size
+    if (newSize > m_Btree->m_MaxPageSize)
+    {
+        btr = BT_MAX_SIZE;
+        goto exit;
+    }
+
+    if (pst.m_Status64 != m_PageStatus.m_Status64)
+    {
+        goto exit;
+    }
+    ClosePage();
+    _ASSERTE(m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);
+ 
+
+    // Allocate the new page
+    HRESULT hr = m_Btree->m_MemoryBroker->Allocate(newSize, (void**)(&newPage), MemObjectType::LeafPage);
+    if (hr != S_OK)
+    {
+        btr = BT_OUT_OF_MEMORY;
+        goto exit;
+    }
+    new(newPage) BtLeafPage(newSize, m_Btree);
+
+	btr = CopyToNewPage(newPage);
+
+	_ASSERTE(newPage->m_nSortedSet == recCount);
+	_ASSERTE(newPage->KeySpaceSize() == keySpace);
+
 
     // Finally install the new page
     if (newPage)
@@ -1431,15 +2141,17 @@ tryagain:
     }
 
 exit:
-    if (sortArr) m_Btree->m_EpochMgr->DeallocateNow(sortArr, MemObjectType::TmpPointerArray);
-    sortArr = nullptr;
 
     if (btr != BT_SUCCESS)
     {
         if (newPage) m_Btree->m_EpochMgr->Deallocate(newPage, MemObjectType::LeafPage);
         newPage = nullptr;
     }
-    newpage = newPage;
+	else
+	{
+	  InterlockedIncrement(&m_Btree->m_nConsolidations);
+	  newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::LeafPage);
+	}
     return btr;
 }
 
@@ -1482,10 +2194,10 @@ BTRESULT BtLeafPage::SplitLeafPage(BtIterator* iter)
   UINT lCount = nrRecords / 2;
   UINT rCount = nrRecords - lCount;
 
-  // Copy first lCount records to the left new page (lowever keys)
+  // Copy first lCount records to the left new page (lower keys)
   UINT keySpace = 0;
   for (UINT i = 0; i < lCount; i++) keySpace += GetKeyPtrPair(i)->m_KeyLen;
-  UINT pageSize = m_Btree->ComputePageSize(lCount, keySpace, 0);
+  UINT pageSize = m_Btree->ComputeLeafPageSize(lCount, keySpace, 0);
 
   BtLeafPage* leftPage = nullptr;
   hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&leftPage), MemObjectType::LeafPage);
@@ -1494,24 +2206,18 @@ BTRESULT BtLeafPage::SplitLeafPage(BtIterator* iter)
       btr = BT_OUT_OF_MEMORY;
       goto exit; 
   }
-
   new(leftPage)BtLeafPage(pageSize, m_Btree);
-  leftPage->m_nSortedSet = lCount;
-  UINT keyOffset = leftPage->PageSize();
+
   for (UINT i = 0; i < lCount; i++)
   {
-	keyOffset -= sortArr[i].m_KeyLen;
-	char* dest = (char*)(leftPage)+ keyOffset;
-	char* src = (char*)(this) + sortArr[i].m_KeyOffset;
-	memcpy(dest, src, sortArr[i].m_KeyLen);
-	leftPage->GetKeyPtrPair(i)->Set(keyOffset, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
+	char* key = (char*)(this) + sortArr[i].m_KeyOffset;
+	leftPage->AppendToSortedSet(key, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
   }
-  leftPage->m_PageStatus.m_Status.m_FirstFreeByte = keyOffset - 1;
 
   // Copy the higher rCount records into the right new page (higher keys)
   keySpace = 0;
   for (UINT i = lCount; i < nrRecords; i++) keySpace += GetKeyPtrPair(i)->m_KeyLen;
-  pageSize = m_Btree->ComputePageSize(rCount, keySpace, 0);
+  pageSize = m_Btree->ComputeLeafPageSize(rCount, keySpace, 0);
 
   BtLeafPage* rightPage = nullptr;
   hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&rightPage), MemObjectType::LeafPage);
@@ -1520,25 +2226,32 @@ BTRESULT BtLeafPage::SplitLeafPage(BtIterator* iter)
       btr = BT_OUT_OF_MEMORY;
       goto exit; 
   }
-
   new(rightPage)BtLeafPage(pageSize, m_Btree);
-  rightPage->m_nSortedSet = rCount;
-  keyOffset = rightPage->PageSize();
+
   for (UINT i = lCount; i < nrRecords; i++)
   {
-	keyOffset -= sortArr[i].m_KeyLen;
-	char* dest = (char*)(rightPage)+ keyOffset;
-	char* src = (char*)(this) + sortArr[i].m_KeyOffset;
-	memcpy(dest, src, sortArr[i].m_KeyLen);
-	rightPage->GetKeyPtrPair(i - lCount)->Set(keyOffset, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
+	char* key = (char*)(this) + sortArr[i].m_KeyOffset;
+	rightPage->AppendToSortedSet( key, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
   }
-  rightPage->m_PageStatus.m_Status.m_FirstFreeByte = keyOffset - 1;
  
   // Use the last key of the left page as separator for the two pages.
   // A separator thus indicates the highest key value allowed on a page.
   // The separator will be added to the parent index page.
   char* separator = (char*)(leftPage)+leftPage->GetKeyPtrPair(lCount-1)->m_KeyOffset;
   UINT seplen = leftPage->GetKeyPtrPair(lCount-1)->m_KeyLen;
+
+  // Install the new pages
+  btr = m_Btree->InstallNewPages(iter, leftPage, rightPage, separator, seplen);
+  if (btr == BT_INSTALL_FAILED)
+  {
+	m_Btree->m_EpochMgr->Deallocate(leftPage, MemObjectType::LeafPage);
+	m_Btree->m_EpochMgr->Deallocate(rightPage, MemObjectType::LeafPage);
+  }
+  else
+  {
+	m_Btree->m_nPageSplits++;
+	m_Btree->m_nLeafPages++;
+  }
 
 #ifdef DISABLED
   fprintf(stdout, "\n=== Splitting leaf page ========= \n");
@@ -1552,43 +2265,222 @@ BTRESULT BtLeafPage::SplitLeafPage(BtIterator* iter)
   fprintf(stdout, "\n===================================\n");
 #endif
 
-  // Now install the two new pages
-  if (iter->m_Count == 1)
+ exit:
+   return btr;
+ }
+
+ BTRESULT BtLeafPage::TryToMergeLeafPage(BtIterator* iter)
   {
-      // Btree object is the parent so update there
-      BtIndexPage* indxPage = m_Btree->CreateIndexPage(leftPage, rightPage, separator, seplen);
-      m_Btree->m_RootPage = indxPage;
-      m_Btree->m_nIndexPages++;
+   BTRESULT btr = BT_SUCCESS;
+
+   BtLeafPage* newPage = nullptr;
+
+   UINT myCount = 0, myKeySpace = 0;
+   UINT leftCount = 0, leftKeySpace = 0;
+   UINT rightCount = 0, rightKeySpace = 0;
+
+   BtIndexPage* parent = (BtIndexPage*)(iter->m_Path[iter->m_Count - 2].m_Page);
+   UINT mySlot = iter->m_Path[iter->m_Count - 2].m_Slot;
+
+   LiveRecordSpace(myCount, myKeySpace);
+
+   BtLeafPage* leftPage = nullptr;
+   BtLeafPage* rightPage = nullptr;
+
+   if (mySlot > 0)
+   {
+	 leftPage = (BtLeafPage*)(parent->GetSortedEntry(mySlot - 1)->m_RecPtr);
+	 leftPage->LiveRecordSpace(leftCount, leftKeySpace);
   }
+   if (mySlot+1 < parent->SortedSetSize())
+   {
+	 rightPage = (BtLeafPage*)(parent->GetSortedEntry(mySlot + 1)->m_RecPtr);
+	 rightPage->LiveRecordSpace(rightCount, rightKeySpace);
+   }
+
+   UINT slotToDelete = 0;
+   enum mergeType { NONE, LEFT, RIGHT} mergeDir;
+   mergeDir = NONE;
+   if (leftPage && rightPage)
+   {
+	 // OK to merge either way
+	 mergeDir = (leftCount * sizeof(KeyPtrPair) + leftKeySpace < rightCount * sizeof(KeyPtrPair) + rightKeySpace) ? LEFT : RIGHT;
+   } else
+	if (leftPage)
+	{
+	  // OK to merge left
+	  mergeDir = LEFT;
+	} else 
+	if (rightPage)
+	{
+	  // OK to merge right
+	  mergeDir = RIGHT;
+	}
+
+
+   // Merge with the smaller neighbouring page
+   if ( mergeDir == LEFT)
+   {
+	 // Merge with left
+	 UINT pageSize = m_Btree->ComputeLeafPageSize(leftCount + myCount, leftKeySpace + myKeySpace, 0);
+	 if (pageSize <= m_Btree->m_MaxPageSize)
+	 {
+		ClosePage();
+		leftPage->ClosePage();
+		btr = MergeLeafPages(leftPage, false, &newPage);
+	   rightPage = nullptr;
+	   slotToDelete = mySlot - 1;
+	 }
+
+   } else
+   if (mergeDir == RIGHT)
+	{
+	  // Merge with right
+	  UINT pageSize = m_Btree->ComputeLeafPageSize(rightCount + myCount, rightKeySpace + myKeySpace, 0);
+	  if (pageSize <= m_Btree->m_MaxPageSize)
+	  {
+		ClosePage();
+		rightPage->ClosePage();
+		btr = MergeLeafPages(rightPage, true, &newPage);
+		leftPage = nullptr;
+		slotToDelete = mySlot;
+	  }
+   }
   else
   {
-      // Create a new instance of the parent index page that includes the new separator 
-      // and the two new pages. Then update the pointer in the grandparent page.
-      BtIndexPage* parentPage = (BtIndexPage*)(iter->m_Path[iter->m_Count - 2].m_Page);
-      UINT oldPos = iter->m_Path[iter->m_Count - 2].m_Slot;
-      BtIndexPage* newIndxPage = nullptr;
-      hr = parentPage->ExpandIndexPage(separator, seplen, leftPage, rightPage, oldPos, newIndxPage);
+	 leftPage = nullptr;
+	 rightPage = nullptr;
+	 newPage = nullptr;
+	 btr = BT_NO_MERGE;
+   }
 
+  BtIndexPage* newParent = nullptr;
+  if (newPage)
+   {
+
+	 // Create new parent index page
+
+	 parent->ShrinkIndexPage(slotToDelete, newParent);
+	 KeyPtrPair* myNewEntry = newParent->GetSortedEntry(slotToDelete);
+	 myNewEntry->m_RecPtr = newPage;
+
+	 // Determine where to install the new page
       BtBasePage** installAddr = nullptr;
-      if (iter->m_Count == 2)
+	 int parentIndx = iter->m_Count - 2;
+	 _ASSERTE(parentIndx >= 0);
+
+	 if (parentIndx == 0)
       {
           // The b-tree object is the grandparent
           installAddr = const_cast<BtBasePage**>(&m_Btree->m_RootPage);
       }
       else
       {
-          BtIndexPage* grandParentPage = (BtIndexPage*)(iter->m_Path[iter->m_Count - 3].m_Page);
-          KeyPtrPair* recEntry = grandParentPage->GetSortedEntry(iter->m_Path[iter->m_Count - 3].m_Slot);
+	   BtIndexPage* grandParentPage = (BtIndexPage*)(iter->m_Path[parentIndx - 1].m_Page);
+	   KeyPtrPair* recEntry = grandParentPage->GetSortedEntry(iter->m_Path[parentIndx - 1].m_Slot);
           installAddr = (BtBasePage**)(&recEntry->m_RecPtr);
       }
-      // TODO - make this atomic
-      *installAddr = newIndxPage;
-       m_Btree->m_EpochMgr->Deallocate(parentPage, MemObjectType::IndexPage);
+
+	 LONG64 oldval = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParent), LONG64(parent));
+	 if (oldval != LONG64(parent))
+	 {
+	   btr = BT_INSTALL_FAILED;
+	   goto exit;
   }
-  m_Btree->m_nLeafPages++;
+	 InterlockedIncrement(&m_Btree->m_nPageMerges);
+  }
+
 
  exit:
+   if (btr != BT_SUCCESS)
+   {
+	 if (newPage) m_Btree->m_MemoryBroker->DeallocateNow(newPage, MemObjectType::LeafPage);
+	 newPage = nullptr;
+	 if (newParent) m_Btree->m_MemoryBroker->DeallocateNow(newParent, MemObjectType::IndexPage);
+	 newParent = nullptr;
+   }
+   else
+   {
+	 if (leftPage)  m_Btree->m_MemoryBroker->Free(leftPage, MemObjectType::LeafPage);
+	 if (rightPage) m_Btree->m_MemoryBroker->Free(rightPage, MemObjectType::LeafPage);
+	 InterlockedDecrement(&m_Btree->m_nLeafPages);
+	 newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::LeafPage);
+   }
+   
    return btr;
+
+ }
+
+ // Merge two leaf pages: this and otherPage. 
+ BTRESULT BtLeafPage::MergeLeafPages(BtLeafPage* otherPage, bool mergeOnRight, BtLeafPage** newPage)
+ {
+
+   BTRESULT btr = BT_SUCCESS;
+
+   KeyPtrPair* leftSortedArr = nullptr;
+   char* leftBase = nullptr;
+   UINT leftRecCount = 0;
+   UINT leftKeySpace = 0;
+   KeyPtrPair* rightSortedArr = nullptr;
+   char* rightBase = nullptr;
+   UINT rightRecCount = 0;
+   UINT rightKeySpace = 0;
+
+   BtLeafPage* newLeafPage = nullptr;
+   *newPage = nullptr;
+
+   if (mergeOnRight)
+   {
+	 btr = ExtractLiveRecords(leftSortedArr, leftRecCount, leftKeySpace);
+	 leftBase = (char*)(this);
+	 btr = otherPage->ExtractLiveRecords(rightSortedArr, rightRecCount, rightKeySpace);
+	 rightBase = (char*)(otherPage);
+   }
+   else
+   {
+	 btr = otherPage->ExtractLiveRecords(leftSortedArr, leftRecCount, leftKeySpace);
+	 leftBase = (char*)(otherPage);
+	 btr = ExtractLiveRecords(rightSortedArr, rightRecCount, rightKeySpace);
+	 rightBase = (char*)(this);
+   }
+
+   UINT keySpace = leftKeySpace + rightKeySpace;
+   UINT pageSize = m_Btree->ComputeLeafPageSize(leftRecCount + rightRecCount, keySpace, 0);
+   HRESULT hr = m_Btree->m_MemoryBroker->Allocate(pageSize, (void**)(&newLeafPage), MemObjectType::LeafPage);
+   if (hr != S_OK)
+   {
+	 btr = BT_OUT_OF_MEMORY;
+	 goto exit;
+   }
+   new(newLeafPage)BtLeafPage(pageSize, m_Btree);
+
+   // Insert the records into the new page
+   for (UINT i = 0; i < leftRecCount; i++)
+   {
+	 KeyPtrPair* pre = &leftSortedArr[i];
+	 char* key = leftBase + pre->m_KeyOffset;
+	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+   }
+   for (UINT i = 0; i < rightRecCount; i++)
+   {
+	 KeyPtrPair* pre = &rightSortedArr[i];
+	 char* key = rightBase + pre->m_KeyOffset;
+	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+   }
+   *newPage = newLeafPage;
+
+ exit:
+   if (leftSortedArr) m_Btree->m_MemoryBroker->DeallocateNow(leftSortedArr, MemObjectType::TmpPointerArray);
+   if (rightSortedArr) m_Btree->m_MemoryBroker->DeallocateNow(rightSortedArr, MemObjectType::TmpPointerArray);
+
+   if (btr != BT_SUCCESS)
+   {
+	 if (newLeafPage) m_Btree->m_MemoryBroker->DeallocateNow(newLeafPage, MemObjectType::LeafPage);
+	 newLeafPage = nullptr;
+   }
+
+   return btr;
+
  }
 
 int DefaultCompareKeys(const void* key1, const int keylen1, const void* key2, const int keylen2)
