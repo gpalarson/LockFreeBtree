@@ -50,9 +50,9 @@ int main()
   KeyType searchKey;
   void*   recFound = nullptr;
 
-  //csrckeys = 50;
+  csrckeys = 45;
   UINT indx = 0;
-  UINT step = 51;
+  UINT step = 13;
   for (UINT i = 0; i < csrckeys; i++)
   {
 	UINT keylen = UINT(strlen(srctable[indx]));
@@ -71,7 +71,9 @@ int main()
     {
         fprintf(stdout, "Lookup failure\n");
     }
-#endif
+    btree->Print(stdout);
+    btree->CheckTree(stdout);
+ #endif
     indx = (indx + step) % csrckeys;
   }
 #ifdef _DEBUG
