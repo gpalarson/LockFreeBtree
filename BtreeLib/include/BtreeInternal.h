@@ -8,8 +8,7 @@
 
 // Forward references
 class BtreeRootInternal;
-class BtLeafPage;
-class BtBasePage;
+class BtreePage;
 class BtIterator;
 
 enum BTRESULT {
@@ -22,6 +21,8 @@ IMemoryAllocator* GetDefaultMemoryAllocator();
 int   DefaultCompareKeys(const void* key1, const int keylen1, const void* key2, const int keylen2);
 
 using CompareFn = int(const void* key1, const int keylen1, const void* key2, const int keylen2);
+
+
 
 struct KeyType
 {
@@ -144,17 +145,19 @@ union PageStatusUnion
 {
   volatile PageStatus	  m_Status;
   volatile LONG64		  m_Status64;
+
+  bool IsClosed() { return (m_Status.m_PageState == PAGE_CLOSED || m_Status.m_PageState == PAGE_CLOSING); }
 };
 
 // A permutation array is a mapping that specifies the sorted ordering of an array of RecordEntries
 struct PermutationArray
 {
-  BtBasePage*             m_TargetPage;      // back pointer to the leaf page
+  BtreePage*             m_TargetPage;      // back pointer to the leaf page
   PageStatusUnion		  m_CreateStatus;	 // page status when the permutation array was created
   UINT					  m_nrEntries;       // Nr of entries in the array
   UINT16				  m_PermArray[1];	 // The actual permutation array begins here
 
-  PermutationArray(BtBasePage* page, UINT count, PageStatusUnion* status)
+  PermutationArray(BtreePage* page, UINT count, PageStatusUnion* status)
   {
       m_TargetPage = page;
 	m_CreateStatus.m_Status64 = status->m_Status64;
@@ -194,12 +197,16 @@ struct BtreeStatistics
 
 };
 
-class BtBasePage
+class BtreePage
 {
   friend class BtreeRootInternal;
- 
+
+public:
+  enum CompType       { LT, LTE, EQ, GTE, GT};
+
 protected:
   enum PageType:UINT8 { NO_PAGE, LEAF_PAGE, INDEX_PAGE };
+
 
   volatile PageStatusUnion	m_PageStatus; // Status of this leaf page
 
@@ -208,78 +215,68 @@ protected:
   UINT16			  m_PageSize;		// Page size in bytes (max 64K)
   UINT16			  m_nSortedSet;		// Nr of records in the sorted set
   volatile LONG       m_WastedSpace;    // Space wasted (in bytes) by records that have been deleted
-
   PermutationArray*   m_PermArr;        // Array giving the sorted order of all elements
-
   KeyPtrPair	      m_RecordArr[1];
 
+  static UINT PageHeaderSize();
+  UINT PageSize() { return m_PageSize; }
+  UINT NetPageSize() { return m_PageSize - PageHeaderSize(); }
+  UINT KeySpaceSize() { return m_PageSize - m_PageStatus.m_Status.m_LastFreeByte - 1; }
+  UINT SortedSetSize() { return m_nSortedSet; }
+  void LiveRecordSpace(UINT& liveRecs, UINT& keySpace);
+  UINT LiveRecordCount();
+
+  bool EnoughFreeSpace(UINT32 keylen, UINT64 pageState);
+  
+  KeyPtrPair* GetUnsortedEntry(UINT indx) { return GetKeyPtrPair(indx + m_nSortedSet); }
+
   UINT AppendToSortedSet(char* separator, UINT sepLen, void* ptr);
+  BTRESULT SortUnsortedSet(KeyPtrPair* pSortedArr, UINT count);
 
-  static UINT PageHeaderSize()
-  {
-      BtBasePage dummy(LEAF_PAGE, 1, nullptr);
-      UINT headerSize = UINT((char*)(&dummy.m_RecordArr[0]) - (char*)(&dummy));
-      return headerSize;
-  }
+  BTRESULT ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, UINT& keySpace);
+  BTRESULT AddRecordToPage(KeyType* key, void* recptr);
+  BTRESULT DeleteRecordFromPage(KeyType* key);
+ BTRESULT CopyToNewPage(BtreePage* newPage);
 
-  BTRESULT MergeIndexPages(BtBasePage* otherPage, bool mergeOnRight, BtBasePage** newPage);
+  void ClosePage();
+
+  BTRESULT TryToMergeLeafPage(BtIterator* iter);
+  BTRESULT MergeLeafPages(BtreePage* otherPage, bool mergeOnRight, BtreePage** newPage);
+  BTRESULT ConsolidateLeafPage(BtIterator* iter, UINT minFree);
+  BTRESULT SplitLeafPage(BtIterator* iter);
+
+  BTRESULT TryToMergeIndexPage(BtIterator* iter);
+  BTRESULT MergeIndexPages(BtreePage* otherPage, bool mergeOnRight, BtreePage** newPage);
+  BTRESULT ExpandIndexPage(char* separator, UINT sepLen, BtreePage* leftPage, BtreePage* rightPage, UINT oldPos, BtreePage*& newPage);
+  BTRESULT ShrinkIndexPage(UINT dropPos, BtreePage*& newIndexPage);
+  BTRESULT SplitIndexPage(BtIterator* iter);
 
   BTRESULT CreatePermutationArray();
-
  
 public:
-    BtBasePage(PageType type, UINT size, BtreeRootInternal* root);
+	BtreePage(PageType type, UINT size, BtreeRootInternal* root);
 
-    bool IsLeafPage() { return m_PageType == LEAF_PAGE; }
-    bool IsIndexPage() { return m_PageType == INDEX_PAGE; }
-    bool IsClosed()    { return (m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);  } 
+	bool IsLeafPage() { return m_PageType == LEAF_PAGE; }
+	bool IsIndexPage() { return m_PageType == INDEX_PAGE; }
+	bool IsClosed()    { return (m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);  } 
 
-    KeyPtrPair* GetKeyPtrPair(UINT indx)
-    {
-        KeyPtrPair* ptr = nullptr;
-        if (indx < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved))
-        {
-            ptr = &m_RecordArr[indx];
-        }
-        return ptr;
-    }
+	BtreeRootInternal* GetBtreeRoot() { return m_Btree; }
+	KeyPtrPair* GetKeyPtrPair(UINT indx);
+	int KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool forwardScan = true);
+	UINT FreeSpace();
 
-    UINT UnusedSpace()
-    {
-        UINT used = PageHeaderSize() + KeySpaceSize() + (m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved) * sizeof(KeyPtrPair);
-        _ASSERTE(used <= m_PageSize);
-        return UINT(m_PageSize - used);
-    }
+	void DeletePage(BtIterator* iter);
 
+	UINT CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
+	UINT CheckLeafPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
 
-  BtreeRootInternal* GetBtreeRoot() { return m_Btree; }
- 
-  int KeySearchGE(KeyType* searchKey);
+	void ComputeTreeStats(BtreeStatistics* statsp);
+	void ComputeLeafStats(BtreeStatistics* statsp);
 
-  void LiveRecordSpace(UINT& liveRecs, UINT& keySpace);
-  UINT LiveRecordCount()
-  {
-      PageStatusUnion pst;
-      pst.m_Status64 = m_PageStatus.m_Status64;
-      return m_nSortedSet + pst.m_Status.m_nUnsortedReserved - pst.m_Status.m_SlotsCleared;
-  }
-
-  // Returns total space for keys, including deleted ones
-  UINT KeySpaceSize()  { return m_PageSize - m_PageStatus.m_Status.m_LastFreeByte - 1; }
-  UINT SortedSetSize() { return m_nSortedSet; }
-  UINT16 PageSize()    { return m_PageSize; }
-
-  void DeletePage(BtIterator* iter);
-
-  BTRESULT ExpandIndexPage(char* separator, UINT sepLen, BtBasePage* leftPage, BtBasePage* rightPage, UINT oldPos, BtBasePage*& newPage);
-  BTRESULT ShrinkIndexPage(UINT dropPos, BtBasePage*& newIndexPage);
-  BTRESULT SplitIndexPage(BtIterator* iter);
-  BTRESULT TryToMergeIndexPage(BtIterator* iter);
-
-  UINT CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
-  void ComputeTreeStats(BtreeStatistics* statsp);
-  void ShortPrint(FILE* file);
-  void PrintPage(FILE* file, UINT level);
+	void ShortPrint(FILE* file);
+	void ShortPrintLeaf(FILE* file);
+	void PrintPage(FILE* file, UINT level);
+	void PrintLeafPage(FILE* file, UINT level);
 
 };
 
@@ -296,68 +293,33 @@ public:
 // A record is deleted by clearing the record pointer field in its descriptor,
 // i.e., deletions are done by marking.
 //
-class BtLeafPage : public BtBasePage
+
+struct KeyComparisonMap
 {
-  friend class BtreeRootInternal;
+  // Maps result from comparison function to bool
+  // First entry is for the case when the comparison return a negative value,
+  // the second for when it returns a zero, and
+  // the third for when it returns a positive value
+  struct CompOutcome { bool m_Result[3]; };
 
+  CompOutcome m_Row[5];
 
-  bool EnoughFreeSpace(UINT32 keylen, UINT64 pageState);
-
-  KeyPtrPair* GetUnsortedEntry(UINT indx)
+  KeyComparisonMap()
   {
-	KeyPtrPair* ptr = nullptr;
-	if (indx < m_PageStatus.m_Status.m_nUnsortedReserved)
-	{
-	  ptr = &m_RecordArr[indx + m_nSortedSet];
-	}
-	return ptr;
+	m_Row[BtreePage::LT] = { true, false, false };
+	m_Row[BtreePage::LTE] = { true, true, false };
+	m_Row[BtreePage::EQ] = { false, true, false };
+	m_Row[BtreePage::GTE] = { false, true, true };
+	m_Row[BtreePage::GT] = { false, false, true };
   }
 
-  static UINT LeafPageHeaderSize()
+  bool CompResult(BtreePage::CompType ct, int cv)
   {
-	BtLeafPage dummy(1, nullptr);
-	UINT headerSize = UINT((char*)(&dummy.m_RecordArr[0]) - (char*)(&dummy));
-	return headerSize;
+	UINT indx = 0;
+	if (cv < 0) indx = 0; else if (cv == 0) indx = 1; else indx = 2;
+	return m_Row[ct].m_Result[indx];
   }
-
-  UINT NetPageSize() { return m_PageSize - LeafPageHeaderSize(); }
-
-  BTRESULT ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, UINT& keySpace);
- 
-  BTRESULT CopyToNewPage(BtLeafPage* newPage);
-
-  BTRESULT TryToMergeLeafPage(BtIterator* iter);
-
-public:
-  // Constructor and destructor. What else did you expect?
-  BtLeafPage(UINT32 size, BtreeRootInternal* root);
-  ~BtLeafPage();
-
-  BTRESULT AddRecordToPage(KeyType* key, void* recptr);
-
-  BTRESULT DeleteRecordFromPage(KeyType* key);
-
-  BTRESULT SortUnsortedSet(KeyPtrPair* pSortedArr, UINT count);
-
- 
-  void ClosePage();
-
-  BTRESULT ConsolidateLeafPage(BtIterator* iter, UINT minFree);
-
-  BTRESULT SplitLeafPage(BtIterator* iter);
-
-  // Merge two leaf pages: this and otherPage. 
-  BTRESULT MergeLeafPages(BtLeafPage* otherPage, bool mergeOnRight, BtLeafPage** newPage);
-
-
-  UINT CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
-  void ComputeTreeStats(BtreeStatistics* statsp);
-  void ShortPrint(FILE* file);
-  void PrintPage(FILE* file, UINT level);
-
 };
-
-
 
 class BtreeRoot
 {
@@ -382,87 +344,78 @@ public:
   }
 
   BTRESULT InsertRecord(KeyType* key, void* recptr);
-
   BTRESULT LookupRecord(KeyType* key, void*& recFound);
-
   BTRESULT DeleteRecord(KeyType* key);
 
   void Print(FILE* file);
-
-  void CheckTree(FILE* f);
+  void CheckTree(FILE* file);
   void PrintStats(FILE* file);
 
 };
 
 class BtreeRootInternal : public BtreeRoot
 {
-  friend class BtBasePage;
-    friend class BtLeafPage;
+  friend class BtreePage;
 
-    MemoryBroker*			  m_MemoryBroker;
+    MemoryBroker*			m_MemoryBroker;
+    EpochManager*           m_EpochMgr;
+    volatile BtreePage*		m_RootPage;
 
-    EpochManager*             m_EpochMgr;
-
-    volatile BtBasePage*	  m_RootPage;
-
-    // Statistics
-  UINT					m_nInserts;			  // Nr of records inserted
-  UINT					m_nDeletes;			  // Nr of records deleted
-  UINT					m_nUpdates;			  // Nr of records updated.
-    UINT                    m_nRecords;           // Nr of records 
+	// Tree status stats
+	UINT                    m_nRecords;           // Nr of records 
     UINT                    m_nLeafPages;         // Nr of leaf pages
     UINT                    m_nIndexPages;        // Nr of index pages
-    UINT                    m_nPageSplits;        // Nr of page splits
+ 
+    // Dynamic statistics
+	UINT					m_nInserts;			  // Nr of records inserted
+	UINT					m_nDeletes;			  // Nr of records deleted
+	UINT					m_nUpdates;			  // Nr of records updated.
+     UINT                   m_nPageSplits;        // Nr of page splits
     UINT                    m_nConsolidations;    // Nr of page consolidations
     UINT                    m_nPageMerges;        // Nr of page merges
 
+
+	// Compute the page size to allocate. 
+	UINT ComputeLeafPageSize(UINT nrRecords, UINT keySpace, UINT minFree);
+	UINT ComputeIndexPageSize(UINT fanout, UINT keySpace);
+
+	BTRESULT FindTargetPage(KeyType* searchKey, BtIterator* iter);
+	BTRESULT AllocateLeafPage(UINT recCount, UINT keySpace, BtreePage*& newPage);
+	BTRESULT AllocateIndexPage(UINT recCount, UINT keySpace, BtreePage*& newPage);
+
+
+	BtreePage* CreateIndexPage(BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen);
+
+	BTRESULT InstallNewPages(BtIterator* iter, BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen);
+	void ComputeTreeStats(BtreeStatistics* statsp);
+
 public:
-  BtreeRootInternal();
+	BtreeRootInternal();
 
-    // Compute the page size to allocate
-  UINT ComputeLeafPageSize(UINT nrRecords, UINT keySpace, UINT minFree);
-  UINT ComputeIndexPageSize(UINT fanout, UINT keySpace);
+	BTRESULT InsertRecordInternal(KeyType* key, void* recptr);
+	BTRESULT LookupRecordInternal(KeyType* key, void*& recFound);
+	BTRESULT DeleteRecordInternal(KeyType* key);
 
-  void ClearStats()
-    {
-	m_nInserts = m_nDeletes = m_nUpdates = 0;
-	m_nPageSplits = m_nConsolidations = m_nPageMerges = 0;
-        }
+	void ClearTreeStats();
+	void PrintTreeStats(FILE* file);
 
-  BtBasePage* CreateEmptyLeafPage();
+	void CheckTree(FILE* file);
+	void Print(FILE* file);
 
-    BtBasePage* CreateIndexPage(BtBasePage* leftPage, BtBasePage* rightPage, char* separator, UINT sepLen);
-
-  BTRESULT InstallNewPages(BtIterator* iter, BtBasePage* leftPage, BtBasePage* rightPage, char* separator, UINT sepLen);
-
-
-    BTRESULT InsertRecordInternal(KeyType* key, void* recptr);
-
-    BTRESULT LookupRecordInternal(KeyType* key, void*& recFound);
-
-    BTRESULT DeleteRecordInternal(KeyType* key);
-
-    BTRESULT FindTargetPage(KeyType* searchKey, BtIterator* iter);
-
-  void ComputeTreeStats(BtreeStatistics* statsp);
-
-    void CheckTree(FILE* file);
-  void Print(FILE* file);
-  void PrintTreeStats(FILE* file);
 };
 
 // Class storing the path taken when descending from the root to a leaf page
 class BtIterator
 {
    friend class BtreeRootInternal;
-  friend class BtBasePage;
-   friend class BtLeafPage;
+  friend class BtreePage;
 
    struct PathEntry
    {
-       BtBasePage*  m_Page;
-       int          m_Slot;
-       UINT         m_RemSpace;
+       BtreePage*		m_Page;
+       int				m_Slot;
+	   PageStatusUnion	m_PageStatus;
+       UINT				m_RemSpace;
    };
 
   static const UINT MaxLevels = 10;
@@ -481,6 +434,8 @@ public:
     {
         m_Path[i].m_Page = nullptr;
         m_Path[i].m_Slot = 0;
+		m_Path[i].m_PageStatus.m_Status64 = 0;
+		m_Path[i].m_RemSpace = 0;
     }
   }
 
@@ -490,11 +445,12 @@ public:
       m_Count = 0;
   }
 
-  void ExtendPath(BtBasePage* page, int slot)
+  void ExtendPath(BtreePage* page, int slot, UINT64 pageStatus64)
   {
 	m_Path[m_Count].m_Page = page;
     m_Path[m_Count].m_Slot = slot;
-	m_Path[m_Count].m_RemSpace = (page->IsLeafPage())? ((BtLeafPage*)(page))->UnusedSpace(): 0;
+	m_Path[m_Count].m_PageStatus.m_Status64 = pageStatus64;
+	m_Path[m_Count].m_RemSpace = page->FreeSpace(); 
 	m_Count++;
   }
 };
