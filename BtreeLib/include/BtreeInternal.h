@@ -1,10 +1,13 @@
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include "mwCAS.h"
 #include "Utilities.h"
 #include "MemoryBroker.h"
 #include "EpochManager.h"
 #include "MemoryBroker.h"
+
+using namespace std; 
 
 // Forward references
 class BtreeRootInternal;
@@ -215,7 +218,7 @@ protected:
   UINT16			  m_PageSize;		// Page size in bytes (max 64K)
   UINT16			  m_nSortedSet;		// Nr of records in the sorted set
   volatile LONG       m_WastedSpace;    // Space wasted (in bytes) by records that have been deleted
-  PermutationArray*   m_PermArr;        // Array giving the sorted order of all elements
+  volatile PermutationArray*   m_PermArr;        // Array giving the sorted order of all elements
   KeyPtrPair	      m_RecordArr[1];
 
   static UINT PageHeaderSize();
@@ -362,9 +365,9 @@ class BtreeRootInternal : public BtreeRoot
     volatile BtreePage*		m_RootPage;
 
 	// Tree status stats
-	UINT                    m_nRecords;           // Nr of records 
-    UINT                    m_nLeafPages;         // Nr of leaf pages
-    UINT                    m_nIndexPages;        // Nr of index pages
+	atomic_uint             m_nRecords;           // Nr of records 
+    atomic_uint             m_nLeafPages;         // Nr of leaf pages
+    atomic_uint             m_nIndexPages;        // Nr of index pages
  
     // Dynamic statistics
 	UINT					m_nInserts;			  // Nr of records inserted

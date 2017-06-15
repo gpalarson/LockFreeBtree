@@ -1,21 +1,90 @@
 #include <Windows.h>
 #include "BtreeInternal.h"
 
-char* rec1 = "record abc";
-char* rec2 = "record bcde";
-char* rec3 = "record abdef";
-
 const int SRC_KEYS = 25000;
 const int MAX_KEYS = 100000;
 const int KEYLENGTH = 32;
 const int MAX_THREADS = 100;
 
-UINT       cthreads = 1;
 UINT       csrckeys = 0;
 int        nokeys = 0;
 char       srctable[SRC_KEYS][KEYLENGTH + 1];
 char       keytable[MAX_KEYS][KEYLENGTH + 1];
 char      *keyptr[MAX_KEYS];
+
+struct ThreadParams
+{
+    UINT        m_ThreadId;
+    HANDLE      m_ThreadHandle;
+    BtreeRoot*  m_Btree;
+
+    UINT        m_Begin;
+    UINT        m_Incr;
+    UINT        m_Mod;
+
+    UINT        m_Inserts;
+
+    UINT        m_RecsInserted;
+
+};
+
+bool            RunFlag = false;
+volatile LONG   threadsRunning = 0;
+UINT            cthreads = 2;
+
+ThreadParams    paramArr[MAX_THREADS];
+
+DWORD WINAPI ThreadFunction(void* p)
+{
+    ThreadParams* param = (ThreadParams*)(p);
+
+    BTRESULT btr = BT_SUCCESS;
+    KeyType searchKey;
+    void*   recFound = nullptr;
+    BtreeRoot* btree = param->m_Btree;
+
+    UINT indx = param->m_Begin;
+    UINT step = param->m_Incr;
+    param->m_RecsInserted = 0;
+
+    INT64 spinCount = 0;
+    while (RunFlag == false)
+    {
+        spinCount++;
+    }
+
+    for (UINT i = 0; i < param->m_Inserts; i++)
+    {
+        UINT keylen = UINT(strlen(srctable[indx]));
+        searchKey.m_pKeyValue = srctable[indx];
+        searchKey.m_KeyLen = keylen;
+
+        btr = btree->InsertRecord(&searchKey, srctable[indx]);
+        if (btr != BT_SUCCESS)
+        {
+            printf("Thread %d: Insertion failure, %s\n", param->m_ThreadId, searchKey.m_pKeyValue);
+         }
+        param->m_RecsInserted++;
+        //btree->Print(stdout);
+#ifdef _DEBUG
+        btr = btree->LookupRecord(&searchKey, recFound);
+        char *charKey = (char*)(recFound);
+        if (btr != BT_SUCCESS || recFound != srctable[indx])
+        {
+            fprintf(stdout, "Thread %d: Lookup failure, %s\n", param->m_ThreadId, searchKey.m_pKeyValue);
+            //btree->CheckTree(stdout);
+        }
+
+#endif
+        indx = (indx + step) % csrckeys;
+    }
+
+    InterlockedDecrement(&threadsRunning);
+
+    printf("Tread %d: %d inserts\n", param->m_ThreadId, param->m_RecsInserted);
+
+    return 0;
+}
 
 int main()
 {
@@ -46,41 +115,42 @@ int main()
 
   BtreeRoot* btree = new BtreeRootInternal();
 
-  HRESULT hr = S_OK;
-  KeyType searchKey;
-  void*   recFound = nullptr;
-
-  //csrckeys = 45;
-  UINT indx = 0;
-  UINT step = 13;
-  for (UINT i = 0; i < csrckeys; i++)
+  for (UINT i = 0; i < cthreads; i++)
   {
-	UINT keylen = UINT(strlen(srctable[indx]));
-    searchKey.m_pKeyValue = srctable[indx];
-    searchKey.m_KeyLen = keylen;
-
-	hr = btree->InsertRecord(&searchKey, srctable[indx]);
-	if (hr != S_OK)
-	{
-	  break;
-	}
-	//btree->Print(stdout);
-#ifdef _DEBUG
-    hr = btree->LookupRecord(&searchKey, recFound);
-    if (hr != S_OK || recFound != srctable[indx])
-    {
-        fprintf(stdout, "Lookup failure\n");
-		btree->CheckTree(stdout); 
-	}
-
- #endif
-    indx = (indx + step) % csrckeys;
+      ThreadParams* par = &paramArr[i];
+      par->m_Btree = btree;
+      par->m_ThreadId = i + 1;
+      par->m_Incr = 51;
+      par->m_Begin = 13 * 13 + i;
+      par->m_Mod = csrckeys;
+      par->m_Inserts = 100; // csrckeys / cthreads;
+      par->m_RecsInserted = 0;
   }
-#ifdef _DEBUG
-  btree->CheckTree(stdout);
-#endif
-  btree->PrintStats(stdout);
+  threadsRunning = cthreads;
 
+  for (UINT i = 0; i < cthreads; i++)
+  { 
+     DWORD threadId = 0;
+     ThreadParams* par = &paramArr[i];
+     par->m_ThreadHandle = CreateThread(NULL, 0, ThreadFunction, par, 0, &threadId);
+     _ASSERTE(par->m_ThreadHandle != NULL);
+  }
+
+  // Release threads to run
+  RunFlag = true;
+
+  while (threadsRunning > 0)
+  {
+      Sleep(1000);
+  }
+
+  btree->Print(stdout);
+  btree->CheckTree(stdout);
+  
+
+   btree->PrintStats(stdout);
+
+#ifdef NOTNOW
   indx = 5;
   for (UINT i = 0; i < csrckeys; i++)
   {
@@ -103,4 +173,5 @@ int main()
   btree->PrintStats(stdout);
 
   btree->Print(stdout);
+#endif
 }

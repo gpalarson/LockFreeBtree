@@ -12,11 +12,14 @@ int BtreePage::KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool for
 {
   static KeyComparisonMap CompMap;
 
+tryagain:
   CreatePermutationArray();
+
+  PermutationArray* permArr = const_cast<PermutationArray* > (m_PermArr);
 
   // Forward or backward scan?
   int first = 0;
-  int last = m_PermArr->m_nrEntries ;
+  int last = permArr->m_nrEntries ;
   int incr = 1;
   if (ctype == LTE || ctype == LT)
   {
@@ -36,7 +39,7 @@ int BtreePage::KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool for
     int cv = 0;
     for (int pos = first; pos != last; pos += incr)
     {
-        indx = m_PermArr->m_PermArray[pos];
+        indx = permArr->m_PermArray[pos];
         pre = GetKeyPtrPair(indx);
         curKey = baseAddr + pre->m_KeyOffset;
         cv = m_Btree->m_CompareFn(searchKey->m_pKeyValue, searchKey->m_KeyLen, curKey, pre->m_KeyLen);
@@ -69,6 +72,11 @@ int BtreePage::KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool for
             }
         }
     }
+    if (permArr->m_CreateStatus.m_Status64 != m_PageStatus.m_Status64)
+    {
+        goto tryagain;
+    }
+
     return indx;
 }
 
@@ -153,43 +161,49 @@ tryagain:
 
     PageStatusUnion initStatus;
     initStatus.m_Status64 = m_PageStatus.m_Status64;
-    BTRESULT hr = BT_SUCCESS;
+    BTRESULT btr = BT_SUCCESS;
 
-    PermutationArray* permArr = m_PermArr;
+    PermutationArray* oldArray = const_cast<PermutationArray*>(m_PermArr);
 
     // Do we already have a permutation array?
-    if (permArr)
+    if (oldArray)
     {
         // We do. Is it still valid?
-        if (permArr->m_CreateStatus.m_Status64 == initStatus.m_Status64)
+        if (oldArray->m_CreateStatus.m_Status64 == initStatus.m_Status64)
         {
-            return hr;
+            goto exit;
         }
-        m_PermArr = nullptr;
-        m_Btree->m_EpochMgr->Deallocate(permArr, MemObjectType::TmpPointerArray);
+        // Existing array is no longer valid so delete it
+        InterlockedCompareExchange64((LONG64*)&m_PermArr, LONG64(0), LONG64(oldArray));
+        m_Btree->m_EpochMgr->Deallocate(oldArray, MemObjectType::TmpPointerArray);
     }
 
     // Need to create a new permutation array
+    PermutationArray* newArray = nullptr;
     UINT count = m_nSortedSet + initStatus.m_Status.m_nUnsortedReserved;
     UINT size = sizeof(PermutationArray) + (count - 1)*sizeof(UINT16);
-    HRESULT hre =  m_Btree->m_MemoryBroker->Allocate(size, (void**)&permArr, MemObjectType::TmpPointerArray);
-    new(permArr) PermutationArray(this, count, &initStatus);
+    HRESULT hre =  m_Btree->m_MemoryBroker->Allocate(size, (void**)&newArray, MemObjectType::TmpPointerArray);
+    new(newArray) PermutationArray(this, count, &initStatus);
     if (initStatus.m_Status.m_nUnsortedReserved > 0)
     {
-        hr = permArr->SortPermArray();
+        btr = newArray->SortPermArray();
     }
 
     // Has new records been added since we filled the permutation array? If so, try again.
     if (initStatus.m_Status.m_nUnsortedReserved < m_PageStatus.m_Status.m_nUnsortedReserved)
     {
-         m_Btree->m_EpochMgr->DeallocateNow(permArr, MemObjectType::TmpPointerArray);
+         m_Btree->m_EpochMgr->DeallocateNow(newArray, MemObjectType::TmpPointerArray);
         goto tryagain;
     }
 
-    m_PermArr = permArr;
+    LONG64 rval = InterlockedCompareExchange64((LONG64*)(&m_PermArr),LONG64(newArray), LONG64(oldArray));
+    if (rval != LONG64(oldArray))
+    {
+        goto tryagain;
+    }
 
-    return hr;
-
+  exit:
+    return btr;
 }
 
 void BtreePage::ComputeLeafStats(BtreeStatistics* statsp)
@@ -678,6 +692,7 @@ UINT BtreePage::AppendToSortedSet(char* key, UINT keyLen, void* ptr)
     m_nSortedSet++;
     KeyPtrPair* pre = GetKeyPtrPair(m_nSortedSet - 1);
     pre->Set(m_PageStatus.m_Status.m_LastFreeByte + 1, keyLen, ptr);
+    pre->CleanEntry();
 
     return m_nSortedSet;
 }
@@ -966,7 +981,7 @@ exit:
   {
 	if (leftPage)  m_Btree->m_MemoryBroker->Free(leftPage, MemObjectType::IndexPage);
 	if (rightPage) m_Btree->m_MemoryBroker->Free(rightPage, MemObjectType::LeafPage);
-	InterlockedDecrement(&m_Btree->m_nIndexPages);
+	m_Btree->m_nIndexPages--;
 	newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::IndexPage);
   }
 
@@ -1352,7 +1367,7 @@ tryagain:
         {
             goto tryagain;
         }
-        _ASSERTE(curPage->IsLeafPage() && curPage->m_PageStatus.m_Status.m_PageState == PAGE_NORMAL);
+        _ASSERTE(curPage->IsLeafPage());
         iter->ExtendPath(curPage, -1, pst.m_Status64);
     }
     return hr;
@@ -1371,7 +1386,7 @@ tryagain:
     BtreePage* rootbase = const_cast<BtreePage*>(m_RootPage);
 
     // Create a new root page if there isn't one already
-    while (rootbase == nullptr)
+    if (rootbase == nullptr)
     {
 		BtreePage* page = nullptr;
 		btr = AllocateLeafPage(1, key->m_KeyLen, page);
@@ -1385,8 +1400,11 @@ tryagain:
             // Another thread already created the page so delete our version
             m_EpochMgr->DeallocateNow(page, MemObjectType::LeafPage);
         }
-        rootbase = const_cast<BtreePage*>(m_RootPage);
-		m_nLeafPages++;
+        else
+        {
+           m_nLeafPages++;
+        }
+        goto tryagain;
     }
 
 
@@ -1442,7 +1460,7 @@ BTRESULT BtreeRootInternal::DeleteRecordInternal(KeyType* key)
     btr = leafPage->DeleteRecordFromPage(key);
     if (btr == BT_SUCCESS)
     {
-	InterlockedDecrement(&m_nRecords);
+	m_nRecords--;
 	m_nDeletes++;
 
 	if (leafPage->LiveRecordCount() == 0)
@@ -1479,6 +1497,8 @@ BTRESULT BtreeRootInternal::LookupRecordInternal(KeyType* key, void*& recFound)
     LONGLONG epochId = 0;
     m_EpochMgr->EnterEpoch(&epochId);
 
+tryagain:
+
     // Locate the target leaf page
     btr = FindTargetPage(key, &iter);
     if (btr != BT_SUCCESS)
@@ -1504,6 +1524,14 @@ BTRESULT BtreeRootInternal::LookupRecordInternal(KeyType* key, void*& recFound)
     KeyPtrPair* kpp = leafPage->GetKeyPtrPair(pos);
     _ASSERTE(kpp);
     recFound = const_cast<void*>(kpp->m_RecPtr);
+
+    PageStatusUnion pst;
+    pst.m_Status64 = leafPage->m_PageStatus.m_Status64;
+
+    if (pst.IsClosed())
+    {
+        goto tryagain;
+    }
 
 exit:
     m_EpochMgr->ExitEpoch(epochId);
@@ -1547,7 +1575,7 @@ void BtreeRootInternal::PrintTreeStats(FILE* file)
 
   fprintf(file, "\n=========== B-tree statistics ===============\n");
   fprintf(file, "Size: %d records, %d leaf pages, %d index pages\n",
-				m_nRecords, m_nLeafPages, m_nIndexPages);
+				UINT(m_nRecords), UINT(m_nLeafPages), UINT(m_nIndexPages));
   fprintf(file, "Operations: %d inserts, %d deletes\n", m_nInserts, m_nDeletes);
   fprintf(file, "Page ops: %d consolidations, %d splits, %d merges\n", m_nConsolidations, m_nPageSplits, m_nPageMerges);
 
@@ -1880,7 +1908,7 @@ void BtreePage::LiveRecordSpace(UINT& recCount, UINT& keySpace)
 	  recCount = 0;
 	  keySpace = 0;
       KeyPtrPair* pre = nullptr;
-	for (UINT i = 0; i < m_nSortedSet + pst.m_Status.m_nUnsortedReserved ; i++)
+	for (UINT i = 0; i < UINT(m_nSortedSet + pst.m_Status.m_nUnsortedReserved) ; i++)
     {
 		pre = GetKeyPtrPair(i);
         if (pre->m_RecPtr)
@@ -2143,6 +2171,7 @@ exit:
 BTRESULT BtreePage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
 {
 
+ tryagain:
     // Get a stable copy of the page status
     PageStatusUnion pst;
     pst.m_Status64 = m_PageStatus.m_Status64;
@@ -2166,10 +2195,10 @@ BTRESULT BtreePage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
 
     if (pst.m_Status64 != m_PageStatus.m_Status64)
     {
-        goto exit;
+        goto tryagain;
     }
 
-	// Now go do the qactual consolidation
+	// Now go do the actual consolidation
     ClosePage();
     _ASSERTE(m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);
  
@@ -2454,7 +2483,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
    {
 	 if (leftPage)  m_Btree->m_MemoryBroker->Free(leftPage, MemObjectType::LeafPage);
 	 if (rightPage) m_Btree->m_MemoryBroker->Free(rightPage, MemObjectType::LeafPage);
-	 InterlockedDecrement(&m_Btree->m_nLeafPages);
+	 m_Btree->m_nLeafPages--;
 	 newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::LeafPage);
    }
    

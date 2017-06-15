@@ -150,8 +150,10 @@ __checkReturn HRESULT MemoryBroker::Free(__in void* pBytes, __in MemObjectType t
   ULONG nAllocatedSize = 0;
   HRESULT hr = m_pMemoryAllocator->GetAllocatedSize(pBytes, &nAllocatedSize);
   
+#ifdef TEMP_DISABLED
   hr = m_pMemoryAllocator->Free(pBytes);
   if (FAILED(hr)) return hr;
+#endif
  
   ::InterlockedExchangeAdd64(&m_nMemoryAllocatedCount, -(__int64)(nAllocatedSize));
 
@@ -228,8 +230,10 @@ __checkReturn HRESULT MemoryBroker::DeallocateNow(__in void* pvMemoryToFree,  __
 	return E_UNEXPECTED;
   }
 
+#ifdef TEMP_DISABLED
   hr = m_pMemoryAllocator->Free(pvMemoryToFree);
   if (FAILED(hr)) return hr;
+#endif
 
   ::InterlockedExchangeAdd64(&m_nMemoryAllocatedCount, -((__int64)nAllocatedSize));
   if (m_nMemoryAllocatedCount < 0)
