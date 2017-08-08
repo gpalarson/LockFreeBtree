@@ -116,7 +116,7 @@ MwCasDescriptorPartition::~MwCasDescriptorPartition()
   MwCASDescriptor* cur = PopFromQueue();
   while (cur)
   {
-	delete cur;
+	_aligned_free(cur);
 	cur = PopFromQueue();
   }
   m_MwDescrPool = nullptr;
@@ -403,7 +403,7 @@ INT32 MwCASDescriptor::AddEntryToDescriptor( __in LONGLONG* addr, __in LONGLONG 
 {
   _ASSERTE(!IsDescriptorPtr(oldval, m_FlagBitMask));
   _ASSERTE(!IsDescriptorPtr(newval, m_FlagBitMask));
-  _ASSERTE(UINT64(addr) % sizeof(LONGLONG) == 0);
+  //_ASSERTE(UINT64(addr) % sizeof(LONGLONG) == 0);
 
 	INT32 retvalue = -1 ; 
 	if( m_Count < MAX_COUNT)

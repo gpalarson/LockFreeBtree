@@ -36,6 +36,7 @@ class MwCasDescriptorPartition;
 class MwCasDescriptorPool;
 class MwCASDescriptor;
 class CondCASDescriptor;
+class BtreePage;
 
 static const UINT CACHE_LINE_SIZE = 64;
 
@@ -418,7 +419,7 @@ template < class T, int FlagPos = 0>
 class MwcTargetField
 {
   static_assert(sizeof(T) == 8, "MwCTargetField type is not of size 8 bytes");
-  static_assert(FlagPos >= 0 && FlagPos < 32, "MwcTargetField flag position out of range");
+  static_assert(FlagPos >= 0 && FlagPos < 64, "MwcTargetField flag position out of range");
 
   volatile T		m_Value;
     
@@ -433,6 +434,16 @@ public:
   T Read()
   {
 	return T(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
+  }
+
+  LONGLONG ReadLL()
+  {
+	return LONGLONG(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
+  }
+
+  BtreePage* ReadPP()
+  {
+	return (BtreePage*)(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
   }
 
 

@@ -6,20 +6,64 @@
 
 
 
+void TraceInfo::Print(FILE* file)
+{
+  fprintf(file, "****** Trace info *******\n");
+
+  fprintf(file, "------ Home page ----\n");
+  if (m_HomePage) m_HomePage->PrintLeafPage(file, 0);
+
+  char * ac = nullptr;
+  for (int i = 0; i < m_ActionCount; i++)
+  {
+	Action* pa = &m_ActionArr[i];
+	switch (pa->m_ActionType)
+	{
+	case NO_ACTION: ac = "NO_ACTON"; break;
+	case CONS_PAGE: ac = "CONS_PAGE"; break;
+	case SPLI_PAGE: ac = "SPLIT_PAGE"; break;
+	case MERGE_PAGE: ac = "MERGE_PAGE"; break;
+	}
+	fprintf(file, "Src page, %s \n", ac);
+	if (pa->m_TrgtPage)
+	{
+	  pa->m_TrgtPage->PrintLeafPage(file, 0);
+	}
+	if (pa->m_ResPage1)
+	{
+	  fprintf(file, "\nResult page 1\n");
+	  pa->m_ResPage1->PrintLeafPage(file, 0);
+	}
+	if (pa->m_ResPage2)
+	{
+	  fprintf(file, "\nResult page 2\n");
+	  pa->m_ResPage2->PrintLeafPage(file, 0);
+	}
+  }
+
+
+  fprintf(file, "*************************\n");
+}
+
 
 
 int BtreePage::KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool forwardScan)
 {
-  static KeyComparisonMap CompMap;
-
+ 
+  
 tryagain:
-  CreatePermutationArray();
 
-  PermutationArray* permArr = const_cast<PermutationArray* > (m_PermArr);
+  PermutationArray* permArr = nullptr;
+  LONGLONG bpsw = m_PageStatus.ReadLL();
+  PageStatus* bpst = (PageStatus*)(&bpsw); 
+  //_ASSERTE(bpst->m_PageState == PAGE_NORMAL);
+  
+  BTRESULT bt = CreatePermutationArray(permArr);
+  _ASSERTE(bt == BT_SUCCESS);
 
   // Forward or backward scan?
   int first = 0;
-  int last = permArr->m_nrEntries ;
+  int last = (m_PageType == LEAF_PAGE)? permArr->m_nrEntries: m_nSortedSet;
   int incr = 1;
   if (ctype == LTE || ctype == LT)
   {
@@ -28,7 +72,6 @@ tryagain:
 	last = 0;
 	incr = -1;
   }
-  bool stopOnEQ = (ctype == LTE || ctype == EQ || ctype == GTE);
 
      // Do a linear serch - use this later for testing binary search.
     char* baseAddr = (char*)(this);
@@ -37,6 +80,7 @@ tryagain:
     KeyPtrPair* pre = nullptr;
     char* curKey = nullptr;
     int cv = 0;
+	int cv2 = 0;
     for (int pos = first; pos != last; pos += incr)
     {
         indx = permArr->m_PermArray[pos];
@@ -61,21 +105,85 @@ tryagain:
         else
         {
 			// Scanning a leaf page
-            if (cv < 0)
+		  switch (ctype)
+		  {
+		  case LT: case GT:
+			if (cv <= 0)
+			{
+			  indx -= incr;
+			  goto loopend;
+			}
+			break;
+		  case LTE: case GTE:
+           if (cv < 0)
             {
                 indx -= incr;
-                break;
+                goto loopend;
             }
-            if (cv == 0 && stopOnEQ)
+		   break;
+		  case EQ:
+			if (cv < 0)
+			{
+			  indx = -1;
+			  goto loopend;
+			}
+           if (cv == 0)
             {
-                break;
+               goto loopend;
             }
+		   break;
+		  }
+ 
+ 
         }
     }
-    if (permArr->m_CreateStatus.m_Status64 != m_PageStatus.m_Status64)
+  loopend:
+
+    if (permArr->m_CreateStatus != 0 && permArr->m_CreateStatus != m_PageStatus)
     {
         goto tryagain;
     }
+
+	LONGLONG epsw = m_PageStatus.ReadLL();
+	if (bpsw != epsw)
+	{
+	  goto tryagain;
+	}
+
+	if (m_PageType == INDEX_PAGE && indx >= 0 && bpst->m_PageState == PAGE_NORMAL)
+	{
+	  int errcnt = 0;
+	  // Make sure key separator in slot indx-1 is less than the search key and the one on slot indx is greater than or qual
+	  if (indx > 0)
+	  {
+		pre = GetKeyPtrPair(indx - 1);
+		curKey = baseAddr + pre->m_KeyOffset;
+		cv = m_Btree->m_CompareFn(searchKey->m_pKeyValue, searchKey->m_KeyLen, curKey, pre->m_KeyLen);
+		
+		if (cv <= 0)
+		{
+		  printf("Thread %d: Separator %*s in indx-1 is GTE than search key %*s\n", GetCurrentThreadId(),
+			int(pre->m_KeyLen), curKey, int(searchKey->m_KeyLen), searchKey->m_pKeyValue);
+		  PrintPage(stdout, 0, false);
+		  errcnt++;
+		}
+	  }
+	  pre = GetKeyPtrPair(indx);
+	  curKey = baseAddr + pre->m_KeyOffset;
+	  int keylen = int(pre->m_KeyLen);
+	  cv = m_Btree->m_CompareFn(searchKey->m_pKeyValue, searchKey->m_KeyLen, curKey, pre->m_KeyLen);
+	  if (cv > 0)
+	  {
+		printf("Thread %d: Separator %.*s in slot %d is less than search key %.*s\n",GetCurrentThreadId(),
+		  keylen, curKey, indx, int(searchKey->m_KeyLen), searchKey->m_pKeyValue);
+		PrintPage(stdout, 0, false);
+		errcnt++;
+	  }
+	  if (errcnt > 0)
+	  {
+		printf("Stop here\n");
+	  }
+	}
 
     return indx;
 }
@@ -155,13 +263,30 @@ INT BinarySearchGE(const char *pSearchKey, const UINT keyLen, const char*baseAdd
     return Trgt;
 }
 
-BTRESULT BtreePage::CreatePermutationArray()
-{
-tryagain:
+static PermutationArray* defaultPermArray = nullptr;
 
-    PageStatusUnion initStatus;
-    initStatus.m_Status64 = m_PageStatus.m_Status64;
+
+BTRESULT BtreePage::CreatePermutationArray( PermutationArray*& permArr)
+{
+  if (m_PageType == INDEX_PAGE)
+  {
+	if (!defaultPermArray)
+	{
+	  UINT size = sizeof(PermutationArray) + (200 - 1) * sizeof(UINT16);
+	  HRESULT hre = m_Btree->m_MemoryBroker->Allocate(size, (void**)&defaultPermArray, MemObjectType::TmpPointerArray);
+	  new(defaultPermArray) PermutationArray(nullptr, 200, 0);
+	}
+	permArr = defaultPermArray;
+	return BT_SUCCESS;
+  }
+    LONGLONG initsw;
+	PageStatus* initpst = (PageStatus*)(&initsw);
     BTRESULT btr = BT_SUCCESS;
+
+ 
+tryagain:
+    initsw = m_PageStatus.ReadLL();
+    btr = BT_SUCCESS;
 
     PermutationArray* oldArray = const_cast<PermutationArray*>(m_PermArr);
 
@@ -169,9 +294,10 @@ tryagain:
     if (oldArray)
     {
         // We do. Is it still valid?
-        if (oldArray->m_CreateStatus.m_Status64 == initStatus.m_Status64)
+        if (oldArray->m_CreateStatus == initsw)
         {
-            goto exit;
+		  permArr = oldArray;
+          goto exit;
         }
         // Existing array is no longer valid so delete it
         InterlockedCompareExchange64((LONG64*)&m_PermArr, LONG64(0), LONG64(oldArray));
@@ -180,19 +306,21 @@ tryagain:
 
     // Need to create a new permutation array
     PermutationArray* newArray = nullptr;
-    UINT count = m_nSortedSet + initStatus.m_Status.m_nUnsortedReserved;
+    UINT count = m_nSortedSet + initpst->m_nUnsortedReserved;
     UINT size = sizeof(PermutationArray) + (count - 1)*sizeof(UINT16);
     HRESULT hre =  m_Btree->m_MemoryBroker->Allocate(size, (void**)&newArray, MemObjectType::TmpPointerArray);
-    new(newArray) PermutationArray(this, count, &initStatus);
-    if (initStatus.m_Status.m_nUnsortedReserved > 0)
+    new(newArray) PermutationArray(this, count, initsw);
+    if (initpst->m_nUnsortedReserved > 0)
     {
         btr = newArray->SortPermArray();
     }
 
     // Has new records been added since we filled the permutation array? If so, try again.
-    if (initStatus.m_Status.m_nUnsortedReserved < m_PageStatus.m_Status.m_nUnsortedReserved)
+	LONGLONG cursw = m_PageStatus.ReadLL();
+	PageStatus* curpst = (PageStatus*)(&cursw);
+    if (initpst->m_nUnsortedReserved < curpst->m_nUnsortedReserved)
     {
-         m_Btree->m_EpochMgr->DeallocateNow(newArray, MemObjectType::TmpPointerArray);
+        m_Btree->m_EpochMgr->DeallocateNow(newArray, MemObjectType::TmpPointerArray);
         goto tryagain;
     }
 
@@ -202,6 +330,13 @@ tryagain:
         goto tryagain;
     }
 
+	permArr = newArray;
+	if (initsw != m_PageStatus.ReadLL())
+	{
+      m_Btree->m_EpochMgr->DeallocateNow(newArray, MemObjectType::TmpPointerArray);
+	  goto tryagain;
+	}
+
   exit:
     return btr;
 }
@@ -210,12 +345,15 @@ void BtreePage::ComputeLeafStats(BtreeStatistics* statsp)
 {
   _ASSERTE(IsLeafPage());
 
+  PageStatus* pst = (PageStatus*)(&m_PageStatus);
+
   statsp->m_LeafPages++;
+  statsp->m_Records += m_nSortedSet + pst->m_nUnsortedReserved - pst->m_SlotsCleared;
   statsp->m_SpaceLP += m_PageSize;
   statsp->m_AllocedSpaceLP += UINT(_msize(this));
   statsp->m_HeaderSpaceLP += PageHeaderSize();
   statsp->m_KeySpaceLP += KeySpaceSize();
-  statsp->m_RecArrSpaceLP += (m_nSortedSet+m_PageStatus.m_Status.m_nUnsortedReserved) * sizeof(KeyPtrPair);
+  statsp->m_RecArrSpaceLP += (m_nSortedSet+pst->m_nUnsortedReserved) * sizeof(KeyPtrPair);
   statsp->m_FreeSpaceLP += FreeSpace();
   statsp->m_DeletedSpaceLP += m_WastedSpace;
   UINT hsize = UINT((char*)(&m_RecordArr[0]) - (char*)(this));
@@ -230,8 +368,10 @@ UINT BtreePage::CheckLeafPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
     char* prevKey = nullptr;
     UINT  prevKeyLen = 0;
     UINT  errorCount = 0;
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
-    for (UINT i = 0; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
+    for (UINT i = 0; i < UINT(m_nSortedSet + pst->m_nUnsortedReserved); i++)
     {
         pre = GetKeyPtrPair(i);
         curKey = (pre->m_KeyLen > 0) ? (char*)(this) + pre->m_KeyOffset : nullptr;
@@ -267,10 +407,10 @@ UINT BtreePage::CheckLeafPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
 	// Check permutatiom array
 	if (m_PermArr)
 	{
-	  if (m_PageStatus.m_Status64 == m_PermArr->m_CreateStatus.m_Status64)
+	  if (psw == m_PermArr->m_CreateStatus)
 	  {
 		_ASSERTE(m_PermArr->m_TargetPage == this);
-		_ASSERTE(m_PermArr->m_nrEntries == m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved);
+		_ASSERTE(m_PermArr->m_nrEntries == m_nSortedSet + pst->m_nUnsortedReserved);
 	  }
 	}
 
@@ -284,9 +424,12 @@ UINT BtreePage::CheckLeafPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
 
 void BtreePage::ShortPrintLeaf(FILE* file)
 {
-    fprintf(file, " LP@0x%llx, %dB, %d+%d", UINT64(this), m_PageSize, m_nSortedSet, m_PageStatus.m_Status.m_nUnsortedReserved);
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
-	if (m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved > 0)
+    fprintf(file, " LP@0x%llx, %dB, %d+%d", UINT64(this), m_PageSize, m_nSortedSet, pst->m_nUnsortedReserved);
+
+	if (m_nSortedSet + pst->m_nUnsortedReserved > 0)
 	{
     KeyPtrPair* pre = GetKeyPtrPair(0);    
     UINT lowKeyLen = pre->m_KeyLen; 
@@ -294,7 +437,7 @@ void BtreePage::ShortPrintLeaf(FILE* file)
     char* lowKey   = (char*)(this) + pre->m_KeyOffset;
     char* hiKey    = (char*)(this) + pre->m_KeyOffset;
 
-	  for (UINT i = 1; i < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved); i++)
+	  for (UINT i = 1; i < UINT(m_nSortedSet + pst->m_nUnsortedReserved); i++)
     {
         pre = GetKeyPtrPair(i);
         char* curKey = (char*)(this) + pre->m_KeyOffset;
@@ -323,50 +466,59 @@ void BtreePage::ShortPrintLeaf(FILE* file)
 
 void BtreePage::PrintLeafPage(FILE* file, UINT level)
 {
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
+
   _ASSERTE(IsLeafPage());
 
-  fprintf(file, "\n------ Leaf page -----------------------\n");
+  fprintf(file, "\n------ Leaf page 0X%I64X -----------------------\n", ULONGLONG(this));
 
-  UINT nUnsorted = m_PageStatus.m_Status.m_nUnsortedReserved;
+  UINT nUnsorted = pst->m_nUnsortedReserved;
   UINT delSpace = 0;
   for (UINT i = 0; i < m_nSortedSet ; i++)
   {
 	KeyPtrPair* pre = GetKeyPtrPair(i);
-	if (!pre->m_RecPtr)
+	if (!pre->m_Pointer.ReadPP())
 	{
 	  delSpace += pre->m_KeyLen + sizeof(KeyPtrPair);
 	}
   }
 
   UINT arrSpace = (m_nSortedSet + nUnsorted) * sizeof(KeyPtrPair);
-  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_LastFreeByte -1;
+  UINT keySpace = m_PageSize - pst->m_LastFreeByte -1;
   UINT32 freeSpace = m_PageSize - PageHeaderSize() - arrSpace - keySpace;
   
   fprintf(file, "Size %d, Usage:  hdr %d array(%d+%d) %d keys %d free %d deleted %d\n", 
 	m_PageSize, PageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
-  fprintf(file, "State: %d, reserved %d, cleared %d, first free %d\n", 
-	m_PageStatus.m_Status.m_PageState, m_PageStatus.m_Status.m_nUnsortedReserved,
-	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_LastFreeByte);
+  PageStatus::PrintPageStatus(file, psw);
+  fprintf(file, "\n");
 
   char* baseAddr = (char*)(this);
-
+  KeyPtrPair* pe = nullptr;
+  char* keyPtr = nullptr;
+  char* recPtr = nullptr;
+  
   fprintf(file, "%d records in sorted area\n", m_nSortedSet);
   for (UINT i = 0; i < m_nSortedSet; i++)
   {
-	KeyPtrPair* pe = GetKeyPtrPair(i);
-	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, ULONGLONG(pe->m_RecPtr));
-	char* keyPtr = (baseAddr + pe->m_KeyOffset);
-	char* recPtr = (pe->m_RecPtr) ? (char*)(pe->m_RecPtr) : ".....................";
+	pe = GetKeyPtrPair(i);
+	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, pe->m_Pointer.ReadLL());
+	keyPtr = (baseAddr + pe->m_KeyOffset);
+	pe->CleanEntry();
+	recPtr = pe->m_Pointer.Read();
+	if (recPtr == nullptr) recPtr =  ".....................";
 	fprintf(file, "  \"%1.*s\", \"%s\"\n", pe->m_KeyLen, keyPtr, recPtr);
   }
 
   fprintf(file, "%d records in unsorted area\n", nUnsorted);
   for (UINT i = 0; i < nUnsorted; i++)
   {
-	KeyPtrPair* pe = GetUnsortedEntry(i);
-	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, ULONGLONG(pe->m_RecPtr));
-	char* keyPtr = (baseAddr + pe->m_KeyOffset);
-	char* recPtr = (pe->m_RecPtr) ? (char*)(pe->m_RecPtr) : ".....................";
+	pe = GetUnsortedEntry(i);
+	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, pe->m_Pointer.ReadLL());
+	keyPtr = (baseAddr + pe->m_KeyOffset);
+	pe->CleanEntry();
+	recPtr = pe->m_Pointer.Read();
+	if( recPtr == nullptr) recPtr =  ".....................";
 	fprintf(file, "  \"%1.*s\", \"%s\"\n", pe->m_KeyLen, keyPtr, recPtr);
   }
 
@@ -401,7 +553,7 @@ void BtreePage::ComputeTreeStats(BtreeStatistics* statsp)
   for (UINT i = 0; i < m_nSortedSet; i++)
   {
 	KeyPtrPair* pre = GetKeyPtrPair(i);
-	BtreePage* page = (BtreePage*)(const_cast<void*>(pre->m_RecPtr));
+	BtreePage* page = pre->m_Pointer.ReadPP();
 	if (page->IsIndexPage())
 	{
 	  page->ComputeTreeStats(statsp);
@@ -481,9 +633,9 @@ UINT BtreePage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
             curKeyLen = pre->m_KeyLen;
             new(&hb)KeyType(curKey, curKeyLen);
 
-            if (pre->m_RecPtr)
+            if (pre->m_Pointer.ReadPP())
             {
-                BtreePage* pg = (BtreePage*)(pre->m_RecPtr);
+                BtreePage* pg = pre->m_Pointer.ReadPP();
                 errorCount += pg->CheckPage(file, &lb, &hb);
             }
 
@@ -494,35 +646,37 @@ UINT BtreePage::CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound)
 }
 
 
-void BtreePage::PrintPage(FILE* file, UINT level)
+void BtreePage::PrintPage(FILE* file, UINT level, bool recursive)
 {
     if (IsLeafPage())
     {
         PrintLeafPage(file, level);
         return;
     }
-  fprintf(file, "\n------ Index page at level %d -----------------\n", level);
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
-  UINT nUnsorted = m_PageStatus.m_Status.m_nUnsortedReserved;
+  fprintf(file, "\n------ Index page 0X%I64X at level %d -----------------\n", ULONGLONG(this), level);
+
+  UINT nUnsorted = pst->m_nUnsortedReserved;
   UINT delSpace = 0;
   for (UINT i = 0; i < m_nSortedSet; i++)
   {
 	KeyPtrPair* pre = GetKeyPtrPair(i);
-	if (!pre->m_RecPtr)
+	if (!pre->m_Pointer.Read())
 	{
 	  delSpace += pre->m_KeyLen + sizeof(KeyPtrPair);
 	}
   }
 
   UINT arrSpace = (m_nSortedSet + nUnsorted) * sizeof(KeyPtrPair);
-  UINT keySpace = m_PageSize - m_PageStatus.m_Status.m_LastFreeByte -1;
+  UINT keySpace = m_PageSize - pst->m_LastFreeByte -1;
   UINT32 freeSpace = m_PageSize - PageHeaderSize() - arrSpace - keySpace;
 
   fprintf(file, "Size %d, Usage:  hdr %d array(%d+%d) %d keys %d free %d deleted %d\n",
 	m_PageSize, PageHeaderSize(), m_nSortedSet, nUnsorted, arrSpace, keySpace, freeSpace, delSpace);
-  fprintf(file, "State: %d, reserved %d, cleared %d, first free %d\n",
-	m_PageStatus.m_Status.m_PageState, m_PageStatus.m_Status.m_nUnsortedReserved,
-	m_PageStatus.m_Status.m_SlotsCleared, m_PageStatus.m_Status.m_LastFreeByte);
+  PageStatus::PrintPageStatus(file, psw);
+  fprintf(file, "\n");
 
   char* baseAddr = (char*)(this);
 
@@ -530,12 +684,12 @@ void BtreePage::PrintPage(FILE* file, UINT level)
   for (UINT i = 0; i < m_nSortedSet; i++)
   {
 	KeyPtrPair* pe = GetKeyPtrPair(i);
-	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, ULONGLONG(pe->m_RecPtr));
+	fprintf(file, "  (%d, %d, 0x%llx):", pe->m_KeyOffset, pe->m_KeyLen, pe->m_Pointer.ReadLL());
    
 	char* keyPtr =( pe->m_KeyLen > 0)? (baseAddr + pe->m_KeyOffset): "----------------";
     fprintf(file, " \"%1.*s\",", pe->m_KeyLen, keyPtr);
 
-    BtreePage* bp = (BtreePage*)(pe->m_RecPtr);
+    BtreePage* bp = pe->m_Pointer.ReadPP();
     if (bp->IsIndexPage()) bp->ShortPrint(file);
     if (bp->IsLeafPage()) bp->ShortPrintLeaf(file);
     fprintf(file, "\n");
@@ -543,11 +697,14 @@ void BtreePage::PrintPage(FILE* file, UINT level)
 
   fprintf(file, "\n----------------------------------------\n");
 
-  for (UINT i = 0; i < m_nSortedSet; i++)
+  if (recursive)
   {
-	KeyPtrPair* pe = GetKeyPtrPair(i);
-    BtreePage* pg = (BtreePage*)(pe->m_RecPtr);
-    if (pg->IsIndexPage()) ((BtreePage*)(pg))->PrintPage(file, level+1);
+	for (UINT i = 0; i < m_nSortedSet; i++)
+	{
+	  KeyPtrPair* pe = GetKeyPtrPair(i);
+	  BtreePage* pg = pe->m_Pointer.ReadPP();
+	  if (true || pg->IsIndexPage()) ((BtreePage*)(pg))->PrintPage(file, level + 1);
+	}
   }
 }
 
@@ -607,7 +764,7 @@ BtreePage* BtreeRootInternal::CreateIndexPage(BtreePage* leftPage, BtreePage* ri
     // Store separator key first and then the high bound
     page->AppendToSortedSet(separator, sepLen, leftPage);
     page->AppendToSortedSet(hibound.m_pKeyValue, hibound.m_KeyLen, rightPage);
-    _ASSERTE(page->FreeSpace() == 0);
+    //_ASSERTE(page->FreeSpace() == 0);
 
  exit:
   return page;
@@ -662,17 +819,24 @@ int BtIndexPage::KeySearchGE(KeyType* searchKey )
 BtreePage::BtreePage(PageType type, UINT size, BtreeRootInternal* root)
 {
     _ASSERTE(size <= 64 * 1024);
+	PageStatus* pst = (PageStatus*)(&m_PageStatus);
+
     memset(this, 0, size);
     m_Btree = root;
     m_PageSize = size;
     m_PageType = type;
     m_nSortedSet = 0;
     m_WastedSpace = 0;
-    m_PageStatus.m_Status.m_LastFreeByte = size - 1;
-    m_PageStatus.m_Status.m_nUnsortedReserved = 0;
-    m_PageStatus.m_Status.m_PageState = PAGE_NORMAL;
-    m_PageStatus.m_Status.m_SlotsCleared = 0;
-    m_PermArr = nullptr;
+    pst->m_LastFreeByte = size - 1;
+    pst->m_nUnsortedReserved = 0;
+    pst->m_PageState = PAGE_NORMAL;
+    pst->m_SlotsCleared = 0;
+	pst->m_PendAction = PA_NONE;
+	m_PermArr = nullptr;
+#ifdef _DEBUG
+	m_SrcPage1 = m_SrcPage2 = nullptr;
+	m_TrgtPage1 = m_TrgtPage2 = nullptr;
+#endif
 }
 
 UINT BtreePage::PageHeaderSize()
@@ -684,14 +848,19 @@ UINT BtreePage::PageHeaderSize()
 
 UINT BtreePage::AppendToSortedSet(char* key, UINT keyLen, void* ptr)
 {
+	// This function will only be called on a new page that the
+	// calling thread has exclusive access to so there is no need
+	// to use interlocked instructions to modify page status.
+	PageStatus* pst = (PageStatus*)(&m_PageStatus);
+
     _ASSERTE(FreeSpace() >= keyLen + sizeof(KeyPtrPair));
-    m_PageStatus.m_Status.m_LastFreeByte -= keyLen;
-    char* dst = (char*)(this) + m_PageStatus.m_Status.m_LastFreeByte + 1;
+    pst->m_LastFreeByte -= keyLen;
+    char* dst = (char*)(this) + pst->m_LastFreeByte + 1;
     memcpy_s(dst, keyLen, key, keyLen);
 
     m_nSortedSet++;
     KeyPtrPair* pre = GetKeyPtrPair(m_nSortedSet - 1);
-    pre->Set(m_PageStatus.m_Status.m_LastFreeByte + 1, keyLen, ptr);
+    pre->Set(pst->m_LastFreeByte + 1, keyLen, ptr);
     pre->CleanEntry();
 
     return m_nSortedSet;
@@ -708,6 +877,8 @@ BTRESULT BtreePage::ExpandIndexPage(char* separator, UINT sepLen, BtreePage* lef
     _ASSERTE(IsIndexPage());
 
 	BTRESULT btr = BT_SUCCESS;
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
     BtreePage* newpage = nullptr;
 	btr = m_Btree->AllocateIndexPage(m_nSortedSet + 1, KeySpaceSize() + sepLen, newpage);
@@ -720,7 +891,8 @@ BTRESULT BtreePage::ExpandIndexPage(char* separator, UINT sepLen, BtreePage* lef
     // but mark it to be split
     if (newpage->PageSize() >= m_Btree->m_MaxPageSize)
     {
-       newpage->m_PageStatus.m_Status.m_PageState = SPLIT_PAGE;
+	  PageStatus* newpst = (PageStatus*)(&newpage->m_PageStatus);
+      newpst->m_PendAction = PA_SPLIT_PAGE;
     }
 
     char* curSep = nullptr;
@@ -736,7 +908,7 @@ BTRESULT BtreePage::ExpandIndexPage(char* separator, UINT sepLen, BtreePage* lef
         {
             pre = GetKeyPtrPair(spos);
             curSep = (char*)(this) + pre->m_KeyOffset;
-            newpage->AppendToSortedSet(curSep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+            newpage->AppendToSortedSet(curSep, pre->m_KeyLen, pre->m_Pointer.Read());
             spos++;
         }
         else
@@ -746,9 +918,9 @@ BTRESULT BtreePage::ExpandIndexPage(char* separator, UINT sepLen, BtreePage* lef
     }
     // The entry in OldPos+1 points to the old page (the one that got split)
     // so we must set it to point to the corresponding new page
-    newpage->GetKeyPtrPair(oldPos + 1)->m_RecPtr = rightPage;
+    newpage->GetKeyPtrPair(oldPos + 1)->m_Pointer = (char*)(rightPage);
 
-    _ASSERTE(newpage->FreeSpace() == 0);
+    //_ASSERTE(newpage->FreeSpace() == 0);
 
     newPage = newpage;
 
@@ -761,7 +933,7 @@ BTRESULT BtreePage::SplitIndexPage(BtIterator* iter)
 {
     _ASSERTE(IsIndexPage());
 
-	ClosePage();
+	//CloseLeafPage();
 
     BTRESULT btr = BT_SUCCESS;
     UINT lCount = m_nSortedSet / 2;
@@ -782,9 +954,9 @@ BTRESULT BtreePage::SplitIndexPage(BtIterator* iter)
     {
         KeyPtrPair* pre = GetKeyPtrPair(i);
         char* sep = (char*)(this) + pre->m_KeyOffset;
-		leftPage->AppendToSortedSet(sep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+		leftPage->AppendToSortedSet(sep, pre->m_KeyLen, pre->m_Pointer.Read());
     }
-    _ASSERTE(leftPage->FreeSpace() == 0);
+    //_ASSERTE(leftPage->FreeSpace() == 0);
 
 
     // Copy the higher rCount records into the right new page (higher keys)
@@ -802,15 +974,22 @@ BTRESULT BtreePage::SplitIndexPage(BtIterator* iter)
     {
         KeyPtrPair* pre = GetKeyPtrPair(i);
         char* sep = (char*)(this) + pre->m_KeyOffset;
-		rightPage->AppendToSortedSet(sep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+		rightPage->AppendToSortedSet(sep, pre->m_KeyLen, pre->m_Pointer.Read());
     }
-    _ASSERTE(rightPage->FreeSpace() == 0);
+    //_ASSERTE(rightPage->FreeSpace() == 0);
 
      // Use the last key of the right page as separator for the two pages.
     // A separator thus indicates the highest key value allowed on a page.
     // The separator will be added to the parent index page.
     char* separator = (char*)(leftPage)+leftPage->GetKeyPtrPair(lCount - 1)->m_KeyOffset;
     UINT seplen = leftPage->GetKeyPtrPair(lCount - 1)->m_KeyLen;
+
+#ifdef _DEBUG
+	leftPage->m_SrcPage1 = this;
+	rightPage->m_SrcPage1 = this;
+	m_TrgtPage1 = leftPage;
+	m_TrgtPage2 = rightPage;
+#endif
 
 	// Install the two new pages
 	btr = m_Btree->InstallNewPages(iter, leftPage, rightPage, separator, seplen);
@@ -866,13 +1045,13 @@ BTRESULT BtreePage::TryToMergeIndexPage(BtIterator* iter)
 
   if (mySlot > 0)
   {
-	leftPage = (BtreePage*)(parent->GetKeyPtrPair(mySlot - 1)->m_RecPtr);
+	leftPage = parent->GetKeyPtrPair(mySlot - 1)->m_Pointer.ReadPP();
 	leftCount = leftPage->m_nSortedSet;
 	leftKeySpace = leftPage->KeySpaceSize();
   }
   if (mySlot + 1 < parent->SortedSetSize())
   {
-	rightPage = (BtreePage*)(parent->GetKeyPtrPair(mySlot + 1)->m_RecPtr);
+	rightPage = parent->GetKeyPtrPair(mySlot + 1)->m_Pointer.ReadPP();
 	rightCount = rightPage->m_nSortedSet;
 	rightKeySpace = rightPage->KeySpaceSize();
   }
@@ -882,7 +1061,8 @@ BTRESULT BtreePage::TryToMergeIndexPage(BtIterator* iter)
   mergeDir = NONE;
   if (leftPage && rightPage)
   {
-	// OK to merge either way
+	// OK to merge either way.
+	// Choose the "smaller" sibling - the one with less live space.
 	mergeDir = (leftCount * sizeof(KeyPtrPair) + leftKeySpace < rightCount * sizeof(KeyPtrPair) + rightKeySpace) ? LEFT : RIGHT;
   }
   else
@@ -937,10 +1117,9 @@ BTRESULT BtreePage::TryToMergeIndexPage(BtIterator* iter)
   {
 
 	// Create new parent index page
-
 	parent->ShrinkIndexPage(slotToDelete, newParent);
 	KeyPtrPair* myNewEntry = newParent->GetKeyPtrPair(slotToDelete);
-	myNewEntry->m_RecPtr = newPage;
+	myNewEntry->m_Pointer = (char*)(newPage);
 
 	// Determine where to install the new page
 	BtreePage** installAddr = nullptr;
@@ -950,13 +1129,13 @@ BTRESULT BtreePage::TryToMergeIndexPage(BtIterator* iter)
 	if (parentIndx == 0)
 	{
 	  // The b-tree object is the grandparent
-	  installAddr = const_cast<BtreePage**>(&m_Btree->m_RootPage);
+	  installAddr = (BtreePage**)(&m_Btree->m_RootPage);
 	}
 	else
 	{
 	  BtreePage* grandParentPage = (BtreePage*)(iter->m_Path[parentIndx - 1].m_Page);
 	  KeyPtrPair* recEntry = grandParentPage->GetKeyPtrPair(iter->m_Path[parentIndx - 1].m_Slot);
-	  installAddr = (BtreePage**)(&recEntry->m_RecPtr);
+	  installAddr = (BtreePage**)(&recEntry->m_Pointer);
 	}
 
 	LONG64 oldval = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParent), LONG64(parent));
@@ -965,7 +1144,6 @@ BTRESULT BtreePage::TryToMergeIndexPage(BtIterator* iter)
 	  btr = BT_INSTALL_FAILED;
 	  goto exit;
 	}
-	InterlockedIncrement(&m_Btree->m_nPageMerges);
   }
 
 
@@ -1026,13 +1204,13 @@ BTRESULT BtreePage::MergeIndexPages(BtreePage* otherPage, bool mergeOnRight, Btr
   {
 	KeyPtrPair* pre = leftPage->GetKeyPtrPair(i);
 	char* key = (char*)(leftPage) + pre->m_KeyOffset;
-	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, pre->m_Pointer.Read());
   }
   for (UINT i = 0; i < rightPage->m_nSortedSet; i++)
   {
 	KeyPtrPair* pre = rightPage->GetKeyPtrPair(i);
 	char* key = (char*)(rightPage) + pre->m_KeyOffset;
-	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	newIndexPage->AppendToSortedSet(key, pre->m_KeyLen, pre->m_Pointer.Read());
   }
   *newPage = newIndexPage;
 
@@ -1070,7 +1248,8 @@ BTRESULT BtreePage::ShrinkIndexPage(UINT dropPos, BtreePage*& newIndexPage)
 
   if (newpage->m_PageSize < m_Btree->m_MinPageSize)
   {
-	newpage->m_PageStatus.m_Status.m_PageState = MERGE_PAGE;
+	PageStatus* newpst = (PageStatus*)(&newpage->m_PageStatus);
+	newpst->m_PendAction = PA_MERGE_PAGE;
   }
  
   char* curSep = nullptr;
@@ -1084,7 +1263,7 @@ BTRESULT BtreePage::ShrinkIndexPage(UINT dropPos, BtreePage*& newIndexPage)
 	{
 	  pre = GetKeyPtrPair(spos);
 	  curSep = (char*)(this) + pre->m_KeyOffset;
-	  newpage->AppendToSortedSet(curSep, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	  newpage->AppendToSortedSet(curSep, pre->m_KeyLen, pre->m_Pointer.Read());
 	}
 	tpos++;
   }
@@ -1138,18 +1317,18 @@ void BtreePage::DeletePage(BtIterator* iter)
   {
 	// Deleting the last page of the tree so set then root pointer to null.
 	_ASSERTE(newIndxPage == nullptr);
-	installAddr = const_cast<BtreePage**>(&m_Btree->m_RootPage);
+	installAddr = (BtreePage**)(&m_Btree->m_RootPage);
   }  else
   if (parentIndx == 0)
   {
 	// The b-tree object is the grandparent
-	installAddr = const_cast<BtreePage**>(&m_Btree->m_RootPage);
+	installAddr = (BtreePage**)(&m_Btree->m_RootPage);
   }
   else
   {
 	BtreePage* grandParentPage = (BtreePage*)(iter->m_Path[parentIndx-1].m_Page);
 	KeyPtrPair* recEntry = grandParentPage->GetKeyPtrPair(iter->m_Path[parentIndx-1].m_Slot);
-	installAddr = (BtreePage**)(&recEntry->m_RecPtr);
+	installAddr = (BtreePage**)(&recEntry->m_Pointer);
   }
   *installAddr = newIndxPage;
   // TODO Make installation atomic...
@@ -1168,62 +1347,130 @@ void BtreePage::DeletePage(BtIterator* iter)
 
 }
 
-BTRESULT BtreeRootInternal::InstallNewPages(BtIterator* iter, BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen)
+BTRESULT BtreeRootInternal::InstallNewPages(BtIterator* iter, BtreePage* leftPage, BtreePage* rightPage, 
+                                            char* separator, UINT sepLen )
 {
 	UINT addedIndexPages = 0;
+
+	BTRESULT btr = BT_SUCCESS;
+	bool installed = false;
+	BtreePage** installAddr = nullptr;
+	BtreePage* expVal = nullptr;
+		
+	PathEntry* curpe = &iter->m_Path[iter->m_Count - 1];
+	BtreePage* curPage = curpe->m_Page;
+
+	PathEntry* parpe = nullptr;
 	BtreePage* newParentPage = nullptr;
 	BtreePage* parentPage = nullptr;
-	BtreePage* expVal = nullptr;
-	BtreePage** installAddr = nullptr;
-	BTRESULT btr = BT_SUCCESS;
+	LONGLONG*  pStatusAddr = nullptr;
+	LONGLONG   parentsw = 0;
+
+	PathEntry* gppe = nullptr;
+	BtreePage* grandParentPage = nullptr;
+	LONGLONG*  gpStatusAddr = nullptr;
+	LONGLONG   gppsw = 0;
 
 	// Install the two new pages
 	if (iter->m_Count == 1)
 	{
+		// We are splitting the root page of the B-tree
 		// B-tree object is the parent so update there
 		newParentPage = CreateIndexPage(leftPage, rightPage, separator, sepLen);
-		expVal = const_cast<BtreePage*>(m_RootPage);
-		installAddr = const_cast<BtreePage**>(&(m_RootPage));
+		installAddr = (BtreePage**)(&(m_RootPage));
+		expVal = curpe->m_Page;
 		addedIndexPages++;
 	}
 	else
 	{
+		// The page has a previous parent page. Need to create a new parent page
+		// that includes the two new pages and a seprator
+		parpe = &iter->m_Path[iter->m_Count - 2];
+
 		// Create a new instance of the parent index page that includes the new separator 
 		// and the two new pages. Then update the pointer in the grandparent page.
-		parentPage = (BtreePage*)(iter->m_Path[iter->m_Count - 2].m_Page);
-		UINT oldPos = iter->m_Path[iter->m_Count - 2].m_Slot;
+		parentPage = parpe->m_Page;
+		parentsw   = parpe->m_PageStatus;
+		pStatusAddr = (LONGLONG*)(&parentPage->m_PageStatus);
+		UINT oldPos = parpe->m_Slot;
 
-		HRESULT hr = parentPage->ExpandIndexPage(separator, sepLen, leftPage, rightPage, oldPos, newParentPage);
+		PageStatus* parentst = (PageStatus*)(&parentsw);
+		_ASSERTE(parentst->m_PageState == PAGE_NORMAL);
+		_ASSERTE(parentst->m_PendAction == PA_NONE);
+
+		// The new parent page is a copy of the old parent page plus the new separator
+		// Make sure that the old parent page doesn't change while we are copying over data
+
+		btr = parentPage->ExpandIndexPage(separator, sepLen, leftPage, rightPage, oldPos, newParentPage);
+		// Did some other thread update the parent page? If so, our new version may not
+		// contain up-to-date information so don't install it.
+		if (parentsw != parentPage->m_PageStatus.ReadLL())
+		{
+		  installed = false;
+		  goto exit;
+		}
+
 
 		if (iter->m_Count == 2)
 		{
 			// The b-tree object is the grandparent
-			installAddr = const_cast<BtreePage**>(&m_RootPage);
+			installAddr = (BtreePage**)(&m_RootPage);
+			expVal = parpe->m_Page;
  
 		}
 		else
 		{
-			BtreePage* grandParentPage = (BtreePage*)(iter->m_Path[iter->m_Count - 3].m_Page);
-			KeyPtrPair* recEntry = grandParentPage->GetKeyPtrPair(iter->m_Path[iter->m_Count - 3].m_Slot);
-			installAddr = (BtreePage**)(&recEntry->m_RecPtr);
+			gppe = &iter->m_Path[iter->m_Count - 3];
+			grandParentPage = gppe->m_Page;
+			gppsw = gppe->m_PageStatus;
+			if (gppsw != grandParentPage->m_PageStatus.ReadLL())
+			{
+			  installed = false ;
+			  goto exit;
+			}
+			gpStatusAddr = (LONGLONG*)(&grandParentPage->m_PageStatus);
+			KeyPtrPair* recEntry = grandParentPage->GetKeyPtrPair(gppe->m_Slot);
+			installAddr = (BtreePage**)(&recEntry->m_Pointer);
 		}
 		expVal = parentPage;
 	}
 
-	LONG64 oldVal = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParentPage), LONG64(expVal));
-	if (oldVal == LONG64(expVal))
+
+	UINT64 mask = (UINT64)(1) << DescriptorFlagPos;
+	MwCasDescriptorPool* pool = const_cast<MwCasDescriptorPool*>(GetDescriptorPool());
+	MwCASDescriptor* desc = pool->AllocateMwCASDescriptor(mask);
+
+	// We always have a new parent page so need to install it
+	INT32 pos = desc->AddEntryToDescriptor((LONGLONG*)(installAddr), LONGLONG(expVal), LONGLONG(newParentPage));
+	if (iter->m_Count > 1)
 	{
-		// Success so delete the old parent page (if there was one)
-		if( parentPage) m_EpochMgr->Deallocate(parentPage, MemObjectType::IndexPage);
-		m_nIndexPages += addedIndexPages;
+	  // Page has a previous parent (index) page. Make the old parent inactive
+	  pos = desc->AddEntryToDescriptor((LONGLONG*)(pStatusAddr), parentsw, PageStatus::MakePageInactive(parentsw));
+	  if (iter->m_Count > 2)
+	  {
+		// Page has a grandparent (index) page - increment its update count (in the status word)
+		pos = desc->AddEntryToDescriptor((LONGLONG*)(gpStatusAddr), gppsw, PageStatus::IncrUpdateCount(gppsw));
+	  }
+	}
+	desc->CloseDescriptor();
+
+	installed = desc->MwCAS(0);
+
+
+exit:
+	if (installed)
+	{
+	  // Success so delete the old parent page (if there was one)
+	  if (parentPage) m_EpochMgr->Deallocate(parentPage, MemObjectType::IndexPage);
+	  m_nIndexPages += addedIndexPages;
+	  btr = BT_SUCCESS;
 	}
 	else
 	{
-		// Failure so delete the new index page
-		m_EpochMgr->DeallocateNow(newParentPage, MemObjectType::IndexPage);
-		btr = BT_INSTALL_FAILED;
+	  // Failure so delete the new parent page
+	  if( newParentPage) m_EpochMgr->DeallocateNow(newParentPage, MemObjectType::IndexPage);
+	  btr = BT_INSTALL_FAILED;
 	}
-
 	return btr;
 }
 
@@ -1259,6 +1506,16 @@ BTRESULT BtreeRoot::DeleteRecord(KeyType* key)
     return btreeInt->DeleteRecordInternal(key);
 }
 
+BTRESULT BtreeRoot::TraceRecord(KeyType* key)
+{
+  if (key == nullptr || key->m_pKeyValue == nullptr || key->m_KeyLen == 0)
+  {
+	return BT_INVALID_ARG;
+  }
+  BtreeRootInternal* btreeInt = (BtreeRootInternal*)(this);
+  return btreeInt->TraceRecordInternal(key);
+}
+
 void BtreeRoot::PrintStats(FILE* file)
 {
   BtreeRootInternal* root = (BtreeRootInternal*)(this);
@@ -1280,6 +1537,7 @@ BtreeRootInternal::BtreeRootInternal()
   m_nInserts = m_nDeletes = m_nUpdates = 0;
   m_nRecords = m_nLeafPages = m_nIndexPages = 0;
   m_nPageSplits = m_nConsolidations = m_nPageMerges = 0;
+  m_FailList = nullptr;
 }
 
 void BtreeRootInternal::ClearTreeStats()
@@ -1292,8 +1550,12 @@ void BtreeRootInternal::ClearTreeStats()
 UINT BtreeRootInternal::ComputeLeafPageSize(UINT nrRecords, UINT keySpace, UINT minFree)
 {
   UINT frontSpace = BtreePage::PageHeaderSize();
-  UINT minKeySpace = nrRecords * sizeof(KeyPtrPair) + keySpace;
+  UINT minKeySpace = sizeof(KeyPtrPair)*nrRecords+ keySpace;
   UINT freeSpace = max(minFree, UINT(minKeySpace*m_FreeSpaceFraction));
+  
+  // Leave room for two average size keys
+  UINT twoKeys = UINT(2.0*(double(minKeySpace) / nrRecords));
+  freeSpace = max(freeSpace, twoKeys);
 
   UINT pageSize = frontSpace + minKeySpace + freeSpace;
   return pageSize;
@@ -1308,69 +1570,137 @@ UINT BtreeRootInternal::ComputeIndexPageSize(UINT fanout, UINT keySpace)
 
 
 // Find the path down to the target leaf page and store it in iter.
-// The function does not include closed or closing pages in the path.
+// The function does not include inactive pages in the path.
 // However, when accessing the pages later on, their status may have changed.
 //
 BTRESULT BtreeRootInternal::FindTargetPage(KeyType* searchKey, BtIterator* iter)
 {
+	int attempts = 0;
+	 LONGLONG psw = 0;
+	 PageStatus* pst = (PageStatus*)(&psw);
+	 BTRESULT btr = BT_SUCCESS;
+	 iter->m_TrInfo = searchKey->m_TrInfo;
+
 tryagain:
-     BTRESULT hr = BT_SUCCESS;
+     btr = BT_SUCCESS;
      iter->m_Count = 0;
-     PageStatusUnion  pst;
 
     // Descend down to the correct leaf page
-    BtreePage* curPage = const_cast<BtreePage*>(m_RootPage);
+    BtreePage* curPage = m_RootPage.ReadPP();
+	int level = 0;
     while (curPage && curPage->IsIndexPage())
     {
-        BtreePage* indxPage = (BtreePage*)(curPage);
-        pst.m_Status64 = indxPage->m_PageStatus.m_Status64;
-       
-        // Can't trust a closed or closing page
-        if (pst.IsClosed())
-        {
-            goto tryagain;
-        }
-
-        int slot = indxPage->KeySearch(searchKey, BtreePage::GTE );
-        _ASSERTE(slot >= 0 && UINT(slot) < indxPage->m_nSortedSet);
-        iter->ExtendPath(curPage, slot, pst.m_Status64);
- 
-
-        // Is it time to split this index page?
-        if (indxPage->m_PageStatus.m_Status.m_PageState == SPLIT_PAGE)
-        {
-            BTRESULT hr = indxPage->SplitIndexPage(iter );
-            if (hr == BT_SUCCESS)
-            {
-                m_nPageSplits++;
-            }
-            goto tryagain;
-        } else
-		if (indxPage->m_PageStatus.m_Status.m_PageState == MERGE_PAGE && iter->m_Count > 1)
+		level++;
+        psw = curPage->m_PageStatus.ReadLL();
+		// Can't use an inactive page
+		if (pst->m_PageState == PAGE_INACTIVE)
 		{
-		  // Try to merge this page with its left or right neighbour
-		  BTRESULT hr = indxPage->TryToMergeIndexPage(iter);
-		  if (hr == BT_SUCCESS)
-		  {
-			goto tryagain;
-        }
+		  goto tryagain;
 		}
- 
-        curPage = (BtreePage*)(indxPage->GetKeyPtrPair(slot)->m_RecPtr);
+
+		int slot = curPage->KeySearch(searchKey, BtreePage::GTE);
+		_ASSERTE(slot >= 0 && UINT(slot) < curPage->m_nSortedSet);
+		iter->ExtendPath(curPage, slot, psw);
+
+		// If the status of the page has changed,
+		// the iterator info may be incorrect so try again
+		if (psw != curPage->m_PageStatus.ReadLL())
+		{
+		  goto tryagain;
+		}
+       
+		// Any pending actions on this page?
+		if (pst->m_PendAction != PA_NONE)
+		{
+		  // Is it time to split this index page?
+		  if (pst->m_PendAction == PA_SPLIT_PAGE)
+		  {
+			if (curPage->SplitIndexPage(iter) == BT_SUCCESS)
+			{
+			  m_nPageSplits++;
+			}
+			goto tryagain;
+		  }
+
+		  // Time to merge the page? But can't merge the root page because
+		  // it has no siblings.
+		  if (pst->m_PendAction == PA_MERGE_PAGE && iter->m_Count > 1)
+		  {
+			// Try to merge this page with its left or right neighbour
+			if (curPage->TryToMergeIndexPage(iter) == BT_SUCCESS)
+			{
+			  m_nPageMerges++;
+			}
+			goto tryagain;
+		  }
+		}
+
+		// Completed all pending actions, if any.
+		// Now move to the next index level but not if the pointer is closed or
+		// the status of the current index page has changed since we entered. 
+		// (The last conditition is safe but perhaps overcautious. 
+		BtreePage* nextPage = curPage->GetKeyPtrPair(slot)->m_Pointer.ReadPP();
+		if (KeyPtrPair::IsClosedBitOn(ULONGLONG(nextPage)) || psw != curPage->m_PageStatus.ReadLL())
+		{
+		  goto tryagain;
+		}
+		curPage = nextPage;
     }
 
     if (curPage)
     {
-         // Can't trust a closed or closing page
-       pst.m_Status64 = curPage->m_PageStatus.m_Status64;
-       if (pst.IsClosed())
-        {
-            goto tryagain;
-        }
-        _ASSERTE(curPage->IsLeafPage());
-        iter->ExtendPath(curPage, -1, pst.m_Status64);
+       psw = curPage->m_PageStatus.ReadLL();
+
+	   if (pst->m_PageState == PAGE_INACTIVE)
+	   {
+		 goto tryagain;
+	   }
+
+	   _ASSERTE(curPage->IsLeafPage());
+	   iter->ExtendPath(curPage, -1, psw);
+
+	 
+		// Any action pending on thsi page
+	   if (pst->m_PendAction != PA_NONE)
+	   {
+		 if (pst->m_PendAction == PA_CONSOLIDATE)
+		 {
+		   if (curPage->ConsolidateLeafPage(iter, 0) == BT_SUCCESS)
+		   {
+			 m_nConsolidations++;
+		   }
+		   goto tryagain;
+		 }
+
+		 // Is it time to split this leaf page?
+		 if (pst->m_PendAction == PA_SPLIT_PAGE)
+		 {
+		   if (curPage->SplitLeafPage(iter) == BT_SUCCESS)
+		   {
+			 m_nPageSplits++;
+		   }
+		   goto tryagain;
+		 }
+
+		 if (pst->m_PendAction == PA_MERGE_PAGE && iter->m_Count > 1)
+		 {
+		   // Try to merge this page with its left or right neighbour
+		   if (curPage->TryToMergeLeafPage(iter) == BT_SUCCESS)
+		   {
+			 m_nPageMerges++;
+		   }
+		   goto tryagain;
+		 }
+	   }
+
+		// Don't trust the page if its status has changed
+		// Perhaps too cautious but better safe than sorry
+		if (psw != curPage->m_PageStatus.ReadLL())
+		{
+		  goto tryagain;
+		}
     }
-    return hr;
+    return btr;
 }
 
 
@@ -1383,7 +1713,7 @@ tryagain:
      BTRESULT btr = BT_SUCCESS;
      BtIterator  iter(this);
  
-    BtreePage* rootbase = const_cast<BtreePage*>(m_RootPage);
+    BtreePage* rootbase = m_RootPage.ReadPP();
 
     // Create a new root page if there isn't one already
     if (rootbase == nullptr)
@@ -1412,34 +1742,108 @@ tryagain:
     btr = FindTargetPage(key, &iter);
     BtreePage* leafPage = (BtreePage*)(iter.m_Path[iter.m_Count-1].m_Page);
     _ASSERTE(leafPage && btr == BT_SUCCESS);
+	PathEntry* ipe = (iter.m_Count > 1) ? &iter.m_Path[iter.m_Count - 2]: nullptr;
+#ifdef DO_LOG
+	InsertInfo::RecInsert('B', key->m_pKeyValue, key->m_KeyLen, leafPage, iter.m_Path[iter.m_Count-1].m_PageStatus, ipe);
+#endif
 
+	LONGLONG lpStatus = leafPage->m_PageStatus.ReadLL();
      btr = leafPage->AddRecordToPage(key, recptr);
-     if (btr == BT_SUCCESS) 
+
+	 if (btr == BT_SUCCESS) 
      {
+#ifdef DISABLED
+	   InsertInfo::RecInsert('E', key->m_pKeyValue, key->m_KeyLen, leafPage, lpStatus, ipe);
+	   if (iter.m_Count > 1)
+	   {
+		 int cv = strncmp(key->m_pKeyValue, iter.m_Path[iter.m_Count - 2].m_Bound, key->m_KeyLen);
+		 if (cv > 0)
+		 {
+		   FILE* LogFile = nullptr;
+		   fopen_s(&LogFile, "LogFile", "w+");
+		   if (LogFile == nullptr)
+		   {
+			 printf("Failed to open log file\n");
+			 LogFile = stdout;
+		   }
+
+		   fprintf(LogFile, "****** Key %*s greater than bound %*s\n\n",
+			 key->m_KeyLen, key->m_pKeyValue, iter.m_Path[iter.m_Count - 2].m_BoundLen, iter.m_Path[iter.m_Count - 2].m_Bound);
+		   fprintf(LogFile, "Printing path down to leaf page\n");
+		   for (UINT i = 0; i < iter.m_Count; i++)
+		   {
+			 PageStatus::PrintPageStatus(LogFile, iter.m_Path[i].m_PageStatus);
+			 printf(" slot %d\n", iter.m_Path[i].m_Slot);
+			 iter.m_Path[i].m_Page->PrintPage(stdout, 0, false);
+		   }
+		   leafPage->PrintLeafPage(LogFile, 0);
+
+		   PrintLog(LogFile, 50000);
+		   fprintf(LogFile, "======= end of log ===========\n");
+		   key->m_TrInfo->Print(LogFile);
+		   if (LogFile != stdout) fclose(LogFile);
+		   printf("Dumpt finished\n");
+		  }
+
+	   }
+#endif
          m_nRecords++;
 		 m_nInserts++;
          goto exit; 
      }
 
+	if (btr == BT_NOT_INSERTED)
+	{
+	  goto tryagain;
+	}
+
     // Page is full so either enlarge and consolidate it or split it
-    // Try consolidation first 
-     BtreePage* newPage = nullptr;
-     btr = leafPage->ConsolidateLeafPage(&iter, key->m_KeyLen+sizeof(KeyPtrPair) );
-     if (btr == BT_SUCCESS)
-     {
-        goto tryagain;
-     }
 
-     // Consolidation failed so try to split the page instead
-    btr = leafPage->SplitLeafPage(&iter);
-    if (btr == BT_SUCCESS)
-    {
-        m_EpochMgr->Deallocate(leafPage, MemObjectType::LeafPage);
-        m_nPageSplits++;
-        goto tryagain;   
-    }
+	_ASSERTE(btr == BT_PAGE_FULL);
+	LONGLONG psw = leafPage->m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
+	LONGLONG newpsw = psw;
+	PageStatus* newpst = (PageStatus*)(&newpsw);
 
-exit:
+	UINT recCount = 0, keySpace = 0;
+	leafPage->LiveRecordSpace(recCount, keySpace);
+
+	UINT newSize = (recCount + 1) * sizeof(KeyPtrPair) + keySpace + key->m_KeyLen;
+	if (newSize < m_MaxPageSize)
+	{
+	  newpst->m_PendAction = PA_CONSOLIDATE;
+	}
+	else
+	{
+	  newpst->m_PendAction = PA_SPLIT_PAGE;
+	}
+	LONG64	rv = InterlockedCompareExchange64((LONGLONG*)(&leafPage->m_PageStatus), newpsw, psw);
+
+	// Do the consolidation or split
+	psw = leafPage->m_PageStatus.ReadLL();
+
+	// Consolidate
+	if (pst->m_PendAction == PA_CONSOLIDATE)
+	{
+	  btr = leafPage->ConsolidateLeafPage(&iter, key->m_KeyLen + sizeof(KeyPtrPair));
+	  goto tryagain;
+	}
+
+     // Do split
+	if (pst->m_PendAction == PA_SPLIT_PAGE)
+	{
+	  btr = leafPage->SplitLeafPage(&iter);
+	  if (btr == BT_SUCCESS)
+	  {
+		m_EpochMgr->Deallocate(leafPage, MemObjectType::LeafPage);
+		m_nPageSplits++;
+	  }
+	  goto tryagain;
+	}
+	goto tryagain;
+
+  exit:
+
     m_EpochMgr->ExitEpoch(epochId);
     return btr;
 }
@@ -1523,12 +1927,17 @@ tryagain:
 
     KeyPtrPair* kpp = leafPage->GetKeyPtrPair(pos);
     _ASSERTE(kpp);
-    recFound = const_cast<void*>(kpp->m_RecPtr);
+    recFound = kpp->m_Pointer.Read();
 
-    PageStatusUnion pst;
-    pst.m_Status64 = leafPage->m_PageStatus.m_Status64;
+	if (KeyPtrPair::IsClosedBitOn(ULONGLONG(recFound)))
+	{
+	  goto tryagain;
+	}
 
-    if (pst.IsClosed())
+	LONGLONG psw = leafPage->m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
+
+    if (pst->IsClosed())
     {
         goto tryagain;
     }
@@ -1538,9 +1947,85 @@ exit:
     return btr;
 }
 
+BTRESULT BtreeRootInternal::TraceRecordInternal(KeyType* key)
+{
+  BTRESULT btr = BT_SUCCESS;
+  BtIterator iter(this);
+
+  LONGLONG epochId = 0;
+  m_EpochMgr->EnterEpoch(&epochId);
+
+
+  // Locate the target leaf page
+  btr = FindTargetPage(key, &iter);
+  if (btr != BT_SUCCESS)
+  {
+	goto exit;
+  }
+  BtreePage* leafPage = (BtreePage*)(iter.m_Path[iter.m_Count - 1].m_Page);
+  _ASSERTE(leafPage);
+  if (!leafPage)
+  {
+	btr = BT_INTERNAL_ERROR;
+	goto exit;
+  }
+
+  // Found the target leaf page, now look for the record
+  int pos = leafPage->KeySearch(key, BtreePage::EQ);
+  if (pos >= 0)
+  {
+	printf("Record found in position %d\n ", pos);
+	leafPage->PrintLeafPage(stdout, 0);
+	goto exit;
+  }
+ 
+  printf("Record not found on leaf page\n");
+
+  printf("========= Index pages =======\n\n");
+  for (UINT i = 0; i < iter.m_Count - 1; i++)
+  {
+	BtreePage* page = iter.m_Path[i].m_Page;
+	page->PrintPage(stdout, i + 1, false);
+  }
+  printf("========== End index pages ==============\n\n");
+
+  BtreePage* curpage = leafPage;
+  while (curpage != nullptr)
+  {
+	curpage->PrintLeafPage(stdout, 0);
+	if (curpage->m_SrcPage1 != nullptr)
+	{
+	  printf("\n============Following Source page pointer =================\n\n");
+	}
+	curpage = curpage->m_SrcPage1;
+  }
+
+  printf("======== Checking failed pages  =====================\n");
+
+  curpage = const_cast<BtreePage*>(m_FailList);
+  while (curpage)
+  {
+	pos = curpage->KeySearch(key, BtreePage::EQ, true);
+	curpage->PrintLeafPage(stdout, 0);
+
+	//if (pos >= 0)
+	//{
+	//  curpage->PrintLeafPage(stdout, 0);
+	//  break;
+	//}
+	curpage = curpage->m_SrcPage2;
+  }
+  printf("================= Checking done ================\n");
+
+exit:
+  m_EpochMgr->ExitEpoch(epochId);
+  return btr;
+}
+
+
 void BtreeRootInternal::Print(FILE* file)
 {
-  BtreePage* rootPage = const_cast<BtreePage*>(m_RootPage);
+  BtreePage* rootPage = m_RootPage.ReadPP();
   if (rootPage)
   {
       rootPage->PrintPage(file, 1);
@@ -1553,7 +2038,7 @@ void BtreeRootInternal::Print(FILE* file)
 
 void BtreeRootInternal::ComputeTreeStats(BtreeStatistics* statsp)
 {
-  BtreePage* rootPage = const_cast<BtreePage*>(m_RootPage);
+  BtreePage* rootPage = m_RootPage.ReadPP();
   if (rootPage)
   {
 	if (rootPage->IsIndexPage())
@@ -1576,14 +2061,15 @@ void BtreeRootInternal::PrintTreeStats(FILE* file)
   fprintf(file, "\n=========== B-tree statistics ===============\n");
   fprintf(file, "Size: %d records, %d leaf pages, %d index pages\n",
 				UINT(m_nRecords), UINT(m_nLeafPages), UINT(m_nIndexPages));
-  fprintf(file, "Operations: %d inserts, %d deletes\n", m_nInserts, m_nDeletes);
-  fprintf(file, "Page ops: %d consolidations, %d splits, %d merges\n", m_nConsolidations, m_nPageSplits, m_nPageMerges);
+  fprintf(file, "Operations: %d inserts, %d deletes\n", UINT(m_nInserts), UINT(m_nDeletes));
+  fprintf(file, "Page ops: %d consolidations, %d splits, %d merges\n", UINT(m_nConsolidations), UINT(m_nPageSplits), UINT(m_nPageMerges));
 
   fprintf(file, "Index pages\n");
   fprintf(file, "   Space: %d alloced, %d pages\n", stats.m_AllocedSpaceIP, stats.m_SpaceIP );
   fprintf(file, "   Space usage: %d headers, %d rec arrays, %d keys\n", stats.m_HeaderSpaceIP, stats.m_RecArrSpaceIP, stats.m_KeySpaceIP);
 
   fprintf(file, "Leaf pages\n");
+  fprintf(file, "   %d live records\n", stats.m_Records);
   fprintf(file, "   Space: %d alloced, %d pages\n", stats.m_AllocedSpaceLP, stats.m_SpaceLP);
   fprintf(file, "   Space usage: %d headers, %d rec arrays, %d keys, %d free, %d deleted\n", 
 	                stats.m_HeaderSpaceLP, stats.m_RecArrSpaceLP, stats.m_KeySpaceLP,
@@ -1601,7 +2087,7 @@ void BtreeRootInternal::CheckTree(FILE* file)
     KeyType::GetMinValue(lowbound.m_pKeyValue, lowbound.m_KeyLen);
     KeyType::GetMaxValue(hibound.m_pKeyValue, hibound.m_KeyLen);
 
-    BtreePage* rootPage = const_cast<BtreePage*>(m_RootPage);
+    BtreePage* rootPage = m_RootPage.ReadPP();
     UINT errorCount = 0;
     if (rootPage)
     {
@@ -1617,59 +2103,69 @@ void BtreeRootInternal::CheckTree(FILE* file)
 
 BTRESULT BtreePage::AddRecordToPage(KeyType* key, void* recptr)
 {
-tryagain:
-
-  PageStatusUnion pst;
-  pst.m_Status64 = m_PageStatus.m_Status64;
-
+  LONGLONG psw = 0;
+  PageStatus* pst = (PageStatus*)(&psw);
   BTRESULT btr = BT_SUCCESS;
-  PageStatusUnion newState;
-  if (pst.IsClosed())
+
+
+tryagain:
+  btr = BT_SUCCESS;
+  psw = m_PageStatus.ReadLL();
+
+  // Page has to be in normal state with no pending actions
+  if (!(pst->m_PageState == PAGE_NORMAL && pst->m_PendAction == PA_NONE))
   {
-      btr = BT_PAGE_CLOSED;
-      goto exit;
+	btr = BT_NOT_INSERTED;
+	goto exit;
   }
 
-  _ASSERTE(pst.m_Status.m_PageState == PAGE_NORMAL);
-  if (!EnoughFreeSpace(key->m_KeyLen, pst.m_Status64))
+  // And have enough free space for the new key/separator
+  if (!EnoughFreeSpace(key->m_KeyLen, psw))
   {
 	btr = BT_PAGE_FULL;
-	goto exit;  
+	goto exit;
   }
-    // Reserve space for the new record
-    newState.m_Status64 = pst.m_Status64;
-    newState.m_Status.m_nUnsortedReserved++;
-    newState.m_Status.m_LastFreeByte -= key->m_KeyLen;
-    LONG64 oldval = InterlockedCompareExchange64((LONG64*)(&m_PageStatus.m_Status64), newState.m_Status64, pst.m_Status64);
-    if (oldval != pst.m_Status64)
-    {
-	    goto tryagain;
-    }
  
- 
+  // Reserve space for the new record by updating page status field.
+  // OK to do so an interlocked operation even though its an MwCAS target field.
+  LONGLONG newpsw = psw;
+  PageStatus* newpst = (PageStatus*)(&newpsw);
+
+  newpsw = psw;
+  newpst->m_nUnsortedReserved++;
+  newpst->m_LastFreeByte -= key->m_KeyLen;
+  LONG64 oldval = InterlockedCompareExchange64((LONG64*)(&m_PageStatus), newpsw, psw);
+  if (oldval != psw)
+  {
+	// No success, some other thread acquired that slot.
+	goto tryagain;
+  }
+
+  // We've now reserved space so it's time to fill it in.
   // First copy the key into its reserved space
-  char* keyBuffer = (char*)(this) + newState.m_Status.m_LastFreeByte + 1;
+  char* keyBuffer = (char*)(this) + newpst->m_LastFreeByte + 1;
   memcpy(keyBuffer, key->m_pKeyValue, key->m_KeyLen);
 
-  // Then fill in the record slot
-  UINT32 slotIndx = newState.m_Status.m_nUnsortedReserved - 1;
-  KeyPtrPair* pentry = GetUnsortedEntry(slotIndx); 
-  pentry->m_KeyOffset = newState.m_Status.m_LastFreeByte + 1;
+  // Then fill in the slot in the record array
+  UINT32 slotIndx = newpst->m_nUnsortedReserved - 1;
+  KeyPtrPair* pentry = GetUnsortedEntry(slotIndx);
+  pentry->m_KeyOffset = newpst->m_LastFreeByte + 1;
   pentry->m_KeyLen = key->m_KeyLen;
   MemoryBarrier();
 
   // Setting the record pointer makes the slot and record visible
-  // Verify that the page is still in NORMAL state. 
-  btr = BT_NOT_INSERTED;
-  if (m_PageStatus.m_Status.m_PageState == PAGE_NORMAL)
+  // Note that we count on the page having been zeroed on creating so we can
+  // assume that m_Pointer is 0.
+  ULONGLONG resVal = InterlockedCompareExchange64((LONGLONG*)(&pentry->m_Pointer), ULONGLONG(recptr), 0);
+  if (resVal != 0)
   {
-    ULONGLONG resVal = InterlockedCompareExchange64((LONGLONG*)(&pentry->m_RecPtr), ULONGLONG(recptr), 0);
-    if (resVal == 0)
-    {
-        btr = BT_SUCCESS;
-    }
+	// Some other thread sneaked in and closed the entry after we acquired the space 
+	_ASSERTE(pentry->IsClosed());
+	btr = BT_NOT_INSERTED;
   }
- 
+  key->m_TrInfo->m_HomePage = this;
+  key->m_TrInfo->m_HomePos = slotIndx;
+
 exit:
   return btr;
 
@@ -1679,18 +2175,16 @@ BTRESULT BtreePage::DeleteRecordFromPage(KeyType* key )
 {
   _ASSERTE(IsLeafPage());
 
-    PageStatusUnion pst;
-    pst.m_Status64 = m_PageStatus.m_Status64;
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
     BTRESULT btr = BT_SUCCESS;
-    if (pst.IsClosed())
+    if (pst->IsClosed())
     {
         btr = BT_PAGE_CLOSED;
         goto exit;
     }
 
-
-    PageStatusUnion newState;
 
     // Locate the record
     int pos = KeySearch(key, EQ);
@@ -1705,11 +2199,11 @@ BTRESULT BtreePage::DeleteRecordFromPage(KeyType* key )
     ULONGLONG recPtr = 0;
     if (kpp)
     {
-        recPtr = ULONGLONG(const_cast<void*>(kpp->m_RecPtr));
+        recPtr = ULONGLONG(kpp->m_Pointer);
         ULONGLONG retVal = 0;
         if (!KeyPtrPair::IsClosedBitOn(recPtr))
         {
-            retVal = InterlockedCompareExchange64((LONGLONG*)(&kpp->m_RecPtr), 0, recPtr);
+            retVal = InterlockedCompareExchange64((LONGLONG*)(&kpp->m_Pointer), 0, recPtr);
             if (retVal != recPtr)
             {
                 if (KeyPtrPair::IsClosedBitOn(retVal))
@@ -1736,26 +2230,27 @@ BTRESULT BtreePage::DeleteRecordFromPage(KeyType* key )
     }
 
     // Update page 
+	LONGLONG newpsw = 0;
+	PageStatus* newpst = (PageStatus*)(&newpsw);
+
     if (btr == BT_SUCCESS)
     {
         // Update page status, that is, increment count of cleared slots
         while(true)
         {
-            pst.m_Status64 = m_PageStatus.m_Status64;
-            newState.m_Status64 = pst.m_Status64;
-            PageStatusUnion retVal;
-            if (pst.m_Status.m_PageState != PAGE_NORMAL)
+            psw = m_PageStatus.ReadLL();
+            if (pst->m_PageState != PAGE_NORMAL)
             {
                 // No need to update the page status
                 break;
             }
-            newState.m_Status64 = pst.m_Status64;
-            newState.m_Status.m_SlotsCleared++;
-            retVal.m_Status64 = InterlockedCompareExchange64(&m_PageStatus.m_Status64, newState.m_Status64, pst.m_Status64);
-            if (retVal.m_Status64 == pst.m_Status64)
+            newpsw = psw;
+            newpst->m_SlotsCleared++;
+            LONGLONG retVal = InterlockedCompareExchange64((LONGLONG*)(&m_PageStatus), newpsw, psw);
+            if (retVal == psw)
             {
                 // Success
-                InterlockedAdd(&m_WastedSpace, sizeof(KeyPtrPair) + kpp->m_KeyLen);
+                m_WastedSpace += sizeof(KeyPtrPair) + kpp->m_KeyLen;
                 break;
             }
 
@@ -1771,14 +2266,15 @@ exit:
 
 bool BtreePage::EnoughFreeSpace(UINT32 keylen, UINT64 pageState)
 {
-  PageStatusUnion pst;
-  pst.m_Status64 = pageState;
+  LONGLONG psw = pageState;
+  PageStatus* pst = (PageStatus*)(&psw);
+
 
   // First free byte (from beginning of the page
-  UINT  slotsUsed = m_nSortedSet + pst.m_Status.m_nUnsortedReserved;
+  UINT  slotsUsed = m_nSortedSet + pst->m_nUnsortedReserved;
   char* firstFree = (char*)(&m_RecordArr[slotsUsed]);
 
-  char* lastFree = (char*)(this) + pst.m_Status.m_LastFreeByte;
+  char* lastFree = (char*)(this) + pst->m_LastFreeByte;
 
   INT64 freeSpace = lastFree - firstFree + 1;
   _ASSERTE(freeSpace >= 0);
@@ -1829,44 +2325,66 @@ BTRESULT BtreePage::SortUnsortedSet(KeyPtrPair* pSortedArr, UINT count)
 
 // Close the page and all its outgoing record pointers.
 // Guaranteed to be true when the function exits
-void BtreePage::ClosePage()
+void BtreePage::CloseLeafPage()
 {
- 
+	_ASSERTE(IsLeafPage());
 
-    PageStatusUnion pst;
+	LONGLONG psw = 0;
+	PageStatus* pst = (PageStatus*)(&psw);
+	LONGLONG newpsw = 0;
+	PageStatus* newpst = (PageStatus*)(&newpsw);
+	LONG64 oldVal = 0;
+	UINT slotCount = 0;
 
     while (true)
     {
-        pst.m_Status64 = m_PageStatus.m_Status64;
+        psw = m_PageStatus.ReadLL();
 
-        if (pst.m_Status.m_PageState == PAGE_CLOSED)
-        {
-            return;
-        }
+		switch( pst->m_PageState)
+		{
+		case PAGE_NORMAL:
+		  // Try to set state to closing
+		  newpsw = psw;
+  		  newpst->m_PageState = PAGE_CLOSING;
+		  oldVal = InterlockedCompareExchange64((LONGLONG*)(&m_PageStatus), newpsw, psw);
+		  // Go try again
+		  break;
 
-        PageStatusUnion newst;
-        newst.m_Status64 = pst.m_Status64;
-        if (pst.m_Status.m_PageState != PAGE_CLOSING)
-        {
-            newst.m_Status.m_PageState = PAGE_CLOSING;
-            LONG64 oldval = InterlockedCompareExchange64(&m_PageStatus.m_Status64, newst.m_Status64, pst.m_Status64);
-        }
+		case PAGE_CLOSING:
+		  slotCount = UINT(m_nSortedSet + pst->m_nUnsortedReserved);
+		  for (UINT i = 0; i < slotCount; i++)
+		  {
+			  KeyPtrPair* kpp = GetKeyPtrPair(i);
+			  kpp->CloseEntry(); 
+		  }
+		  newpsw = psw;
+		  newpst->m_PageState = PAGE_CLOSED;
+		  oldVal = InterlockedCompareExchange64((LONGLONG*)(&m_PageStatus), newpsw, psw);
+		  // Fails if some other thread already closed the page
+		  break;
 
-        for (UINT i = 0; i < UINT(m_nSortedSet + pst.m_Status.m_nUnsortedReserved); i++)
-        {
-            KeyPtrPair* kpp = GetKeyPtrPair(i);
-            kpp->CloseEntry(); 
+		case PAGE_CLOSED:
+		  newpsw = m_PageStatus.ReadLL();
+		  _ASSERTE(pst->m_nUnsortedReserved == newpst->m_nUnsortedReserved);
+           return;
+
+		case PAGE_INACTIVE:
+		  return;
+
+		default:
+		  _ASSERTE(false);
         }
-        newst.m_Status.m_PageState = PAGE_CLOSED;
-        LONG64 oldval = InterlockedCompareExchange64(&m_PageStatus.m_Status64, newst.m_Status64, pst.m_Status64);
     }
 
 }
 
 KeyPtrPair* BtreePage::GetKeyPtrPair(UINT indx)
 {
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
+
   KeyPtrPair* ptr = nullptr;
-  if (indx < UINT(m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved))
+  if (indx < UINT(m_nSortedSet + pst->m_nUnsortedReserved))
   {
 	ptr = &m_RecordArr[indx];
   }
@@ -1875,26 +2393,35 @@ KeyPtrPair* BtreePage::GetKeyPtrPair(UINT indx)
 
 UINT BtreePage::FreeSpace()
 {
-  UINT used = PageHeaderSize() + KeySpaceSize() + (m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved) * sizeof(KeyPtrPair);
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
+
+  UINT used = PageHeaderSize() + KeySpaceSize() + (m_nSortedSet + pst->m_nUnsortedReserved) * sizeof(KeyPtrPair);
   _ASSERTE(used <= m_PageSize);
   return UINT(m_PageSize - used);
 }
 
 UINT BtreePage::LiveRecordCount()
 {
-  PageStatusUnion pst;
-  pst.m_Status64 = m_PageStatus.m_Status64;
-  return m_nSortedSet + pst.m_Status.m_nUnsortedReserved - pst.m_Status.m_SlotsCleared;
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
+  UINT count = m_nSortedSet + pst->m_nUnsortedReserved;
+  if (m_PageType == LEAF_PAGE)
+  {
+	count -= pst->m_SlotsCleared;
+  }
+  return  count ;
 }
 
 // Get a consistent count of the number of live records and the key space they require
 void BtreePage::LiveRecordSpace(UINT& recCount, UINT& keySpace)
 {
-  PageStatusUnion pst;
+  LONGLONG psw = 0;
+  PageStatus* pst = (PageStatus*)(&psw);
 
   do
   {
-    pst.m_Status64 = m_PageStatus.m_Status64;
+    psw = m_PageStatus.ReadLL();
 
 	if (IsIndexPage())
 	{
@@ -1904,24 +2431,23 @@ void BtreePage::LiveRecordSpace(UINT& recCount, UINT& keySpace)
 	else
 	{
 
-    // Count the number of records remaining on the page and the amount of space needed for the new page
+	  // Count the number of records remaining on the page and the amount of space needed for the new page
 	  recCount = 0;
 	  keySpace = 0;
-      KeyPtrPair* pre = nullptr;
-	for (UINT i = 0; i < UINT(m_nSortedSet + pst.m_Status.m_nUnsortedReserved) ; i++)
-    {
-		pre = GetKeyPtrPair(i);
-        if (pre->m_RecPtr)
-        {
-            recCount++;
-            keySpace += pre->m_KeyLen;
-        }
-    }
-
+	  KeyPtrPair* pre = nullptr;
+	  for (UINT i = 0; i < UINT(m_nSortedSet + pst->m_nUnsortedReserved) ; i++)
+	  {
+		  pre = GetKeyPtrPair(i);
+		  if (pre->m_Pointer.Read())
+		  {
+			  recCount++;
+			  keySpace += pre->m_KeyLen;
+		  }
+	  }
 	}
 	
 	// Try again if page status has changed. 
-  } while (pst.m_Status64 != m_PageStatus.m_Status64);
+  } while (psw != m_PageStatus.ReadLL());
 
 }
 
@@ -1937,7 +2463,7 @@ BTRESULT BtreePage::ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, U
   keySpace = 0;
   HRESULT hr = m_Btree->m_MemoryBroker->Allocate(liveRecs*sizeof(KeyPtrPair), (void**)(&liveRecArray), MemObjectType::TmpPointerArray);
   if (hr != S_OK)
-        {
+  {
 	btr = BT_OUT_OF_MEMORY;
 	goto exit;
   }
@@ -1948,16 +2474,18 @@ BTRESULT BtreePage::ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, U
 	KeyPtrPair* pre = &m_RecordArr[i];
 	if (!pre->IsDeleted())
 	{
-	  liveRecArray[recCount] = *pre;
-            recCount++;
-            keySpace += pre->m_KeyLen;
-        }
+	  liveRecArray[recCount].Set(pre->m_KeyOffset, pre->m_KeyLen, pre->m_Pointer.ReadPP());
+	  recCount++;
+      keySpace += pre->m_KeyLen;
     }
+  }
 
   // Copy the unsorted record entries into an array and sort them
   //
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
   KeyPtrPair* sortArr = nullptr;
-  UINT nrUnsorted = m_PageStatus.m_Status.m_nUnsortedReserved;
+  UINT nrUnsorted = pst->m_nUnsortedReserved;
   UINT srcCount = 0;
   if (nrUnsorted > 0)
     {
@@ -1972,7 +2500,7 @@ BTRESULT BtreePage::ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, U
 	for (UINT i = 0; i < nrUnsorted; i++)
     {
 	  pre = GetUnsortedEntry(i);
-	  if (pre->m_RecPtr != nullptr)
+	  if (pre->m_Pointer.Read() != nullptr)
 	  {
 		sortArr[srcCount] = *pre;
 		srcCount++;
@@ -2043,15 +2571,15 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
 {
   _ASSERTE(IsLeafPage());
 
-  PageStatusUnion pst;
-  pst.m_Status64 = m_PageStatus.m_Status64;
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
 
   KeyPtrPair* sortArr = nullptr;
   BTRESULT btr = BT_SUCCESS;
   
     // Copy the unsorted record entries into an array and sort them
   //
-  UINT nrUnsorted = pst.m_Status.m_nUnsortedReserved;
+  UINT nrUnsorted = pst->m_nUnsortedReserved;
   UINT rCount = 0; 
   if (nrUnsorted > 0)
   {
@@ -2067,7 +2595,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
     for (UINT i = 0; i < nrUnsorted; i++)
     {
         pre = GetUnsortedEntry(i);
-	  if (pre->m_RecPtr != nullptr)
+	  if (pre->m_Pointer.Read() != nullptr)
 	  {
 		sortArr[rCount] = *pre;
 		rCount++;
@@ -2089,7 +2617,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
     while (lCount > 0 && rCount > 0)
     {
         // Skip deleted entries in the sorted set
-        if (pLeft->m_RecPtr == nullptr)
+        if (pLeft->m_Pointer.Read() == nullptr)
         {
             pLeft++;
             lCount--;
@@ -2103,7 +2631,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
         if (cv <= 0)
         {
             // Copy record entry and key value from left input
-	  newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
+	  newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, pLeft->m_Pointer.Read());
 	  copiedRecs++;
 	  copiedSpace += pLeft->m_KeyLen;
 
@@ -2114,7 +2642,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
         else
         {
             // Copy record entry and key value from left input
-	  newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
+	  newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, pRight->m_Pointer.Read());
 
 	  copiedRecs++;
 	  copiedSpace += pRight->m_KeyLen;
@@ -2128,7 +2656,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
     // Copy remaining, if any, from left or right
     while (lCount > 0)
     {
-	if (pLeft->m_RecPtr == nullptr)
+	if (pLeft->m_Pointer.Read() == nullptr)
 	{
 	  pLeft++;
 	  lCount--;
@@ -2137,7 +2665,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
 
         // Copy record entry and key value from left input
         char* lKey = (char*)(this) + pLeft->m_KeyOffset;
-	newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, const_cast<void*>(pLeft->m_RecPtr));
+	newPage->AppendToSortedSet(lKey, pLeft->m_KeyLen, pLeft->m_Pointer.Read());
 	copiedRecs++;
 	copiedSpace += pLeft->m_KeyLen;
 
@@ -2150,7 +2678,7 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
     {
         // Copy record entry and key value from right input
         char* rKey = (char*)(this) + pRight->m_KeyOffset;
-	newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, const_cast<void*>(pRight->m_RecPtr));
+	newPage->AppendToSortedSet(rKey, pRight->m_KeyLen, pRight->m_Pointer.Read());
 	copiedRecs++;
 	copiedSpace += pRight->m_KeyLen;
 
@@ -2163,22 +2691,26 @@ BTRESULT BtreePage::CopyToNewPage(BtreePage* newPage)
     {
         newPage->m_RecordArr[i].CleanEntry();
     }
+#ifdef _DEBUG
+	newPage->m_SrcPage1 = this;
+	m_TrgtPage1 = newPage;
+#endif
 
 exit:
   return btr;
 }
+
 
 BTRESULT BtreePage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
 {
 
  tryagain:
     // Get a stable copy of the page status
-    PageStatusUnion pst;
-    pst.m_Status64 = m_PageStatus.m_Status64;
+	LONGLONG psw = m_PageStatus.ReadLL();
+	PageStatus* pst = (PageStatus*)(&psw);
 
     BTRESULT btr = BT_SUCCESS;
     BtreePage* newPage = nullptr;
-
 
     UINT recCount = 0;
     UINT keySpace = 0;	
@@ -2186,21 +2718,21 @@ BTRESULT BtreePage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
 
     UINT newSize = m_Btree->ComputeLeafPageSize(recCount, keySpace, minFree);
 
-    // Don't expand beyond maximum page size
-    if (newSize > m_Btree->m_MaxPageSize)
-    {
-        btr = BT_MAX_SIZE;
-        goto exit;
-    }
-
-    if (pst.m_Status64 != m_PageStatus.m_Status64)
+    if (psw != m_PageStatus.ReadLL())
     {
         goto tryagain;
     }
 
 	// Now go do the actual consolidation
-    ClosePage();
-    _ASSERTE(m_PageStatus.m_Status.m_PageState == PAGE_CLOSED);
+    CloseLeafPage();
+	psw = m_PageStatus.ReadLL();
+
+#ifdef DO_LOG
+	ConsInfo::RecCons('B', this, psw, nullptr, 0, recCount);
+#endif
+
+	// Recompute space requirements
+	LiveRecordSpace(recCount, keySpace);
  
 	btr = m_Btree->AllocateLeafPage(recCount, keySpace, newPage);
 	if( btr != BT_SUCCESS)
@@ -2211,31 +2743,87 @@ BTRESULT BtreePage::ConsolidateLeafPage(BtIterator* iter, UINT minFree)
 	btr = CopyToNewPage(newPage);
 	_ASSERTE(newPage->m_nSortedSet == recCount);
 	_ASSERTE(newPage->KeySpaceSize() == keySpace);
-
+	
+	if (psw != m_PageStatus.ReadLL())
+	{
+	  btr = BT_INSTALL_FAILED;
+	  goto exit;
+	}
+	
 
     // Finally install the new page
-    if (newPage)
+	if (newPage)
     {
+		_ASSERTE(LiveRecordCount() == newPage->LiveRecordCount());
+		LONGLONG newpsw = newPage->m_PageStatus.ReadLL();
+		PageStatus* newpst = (PageStatus*)(&newpsw);
+		_ASSERTE(newpst->m_PageState == PAGE_NORMAL);
+		_ASSERTE(newpst->m_PendAction == PA_NONE);
+		_ASSERTE(newPage->m_nSortedSet == recCount);
+
         BtreePage** installAddr = nullptr;
+		LONGLONG*   pStatusAddr = nullptr;
+		LONGLONG	pStatusVal = 0;
+		PageStatus* pst = (PageStatus*)(&pStatusVal);
+		bool      installed = false;
+
         if (iter->m_Count == 1)
         {
-            installAddr = const_cast<BtreePage**>(&m_Btree->m_RootPage);
+            installAddr = (BtreePage**)(&m_Btree->m_RootPage);
         }
         else
         {
             BtreePage* parentPage = (BtreePage*)(iter->m_Path[iter->m_Count - 2].m_Page);
             KeyPtrPair* recEntry = parentPage->GetKeyPtrPair(iter->m_Path[iter->m_Count - 2].m_Slot);
-            installAddr = (BtreePage**)(&recEntry->m_RecPtr);
+            installAddr = (BtreePage**)(&recEntry->m_Pointer);
+			pStatusAddr = (LONGLONG*)(&parentPage->m_PageStatus);
+			pStatusVal = iter->m_Path[iter->m_Count - 2].m_PageStatus;
         }
 
-        LONG64 oldval = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newPage), LONG64(this));
-        if (oldval != LONG64(this))
+		UINT64 mask = (UINT64)(1) << DescriptorFlagPos;
+		MwCasDescriptorPool* pool = const_cast<MwCasDescriptorPool*>(GetDescriptorPool());
+		MwCASDescriptor* desc = pool->AllocateMwCASDescriptor(mask);
+
+		// Update record pointer
+		INT32 pos = desc->AddEntryToDescriptor((LONGLONG*)(installAddr), LONGLONG(this), LONGLONG(newPage));
+
+		if (pStatusAddr != nullptr)
+		{
+		  // Increment update counter of parent index page
+		  pos = desc->AddEntryToDescriptor((LONGLONG*)(pStatusAddr), pStatusVal, PageStatus::IncrUpdateCount(pStatusVal));
+		}
+
+		// Make current leaf page inactive
+		LONGLONG* curStatusAddr = (LONGLONG*)(&m_PageStatus);
+		desc->AddEntryToDescriptor(curStatusAddr, psw, PageStatus::MakePageInactive(psw));
+
+		desc->CloseDescriptor();
+
+		installed = desc->MwCAS(0);
+	
+        if (!installed)
         {
             btr = BT_INSTALL_FAILED;
-        }
-    }
+#ifdef NOTUSED
+			printf("Thread %d: Install failed, p=0x%I64x, np=0x%I64x, cnt=%d, size=%d\n",
+			        GetCurrentThreadId(), ULONGLONG(this), ULONGLONG(newPage), recCount, newPage->m_PageSize);
+			while (true)
+			{
+			  BtreePage* expVal = const_cast<BtreePage*>(m_Btree->m_FailList);
+			  newPage->m_SrcPage2 = expVal;
+			  LONGLONG oldVal = InterlockedCompareExchange64((LONGLONG*)(&m_Btree->m_FailList), LONGLONG(newPage), LONGLONG(expVal));
+			  if (oldVal == LONGLONG(expVal)) break;
+			}
+#endif
+		}
+#ifdef DO_LOG
+		ConsInfo::RecCons('E', this, psw, newPage, 0, recCount);
+#endif
+
+	}
 
 exit:
+	iter->m_TrInfo->RecordAction(TraceInfo::CONS_PAGE, btr == BT_SUCCESS, this, newPage, nullptr);
 
     if (btr != BT_SUCCESS)
     {
@@ -2244,7 +2832,7 @@ exit:
     }
 	else
 	{
-	  InterlockedIncrement(&m_Btree->m_nConsolidations);
+	  m_Btree->m_nConsolidations++;
 	  newPage->m_Btree->m_MemoryBroker->Free(this, MemObjectType::LeafPage);
 	}
     return btr;
@@ -2253,14 +2841,19 @@ exit:
 
 BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 {
-  // The page is assumed to be closed at this point so its state remains unchanged
-
-  ClosePage();
+ 
+  CloseLeafPage();
 
   BTRESULT btr = BT_SUCCESS;
+  LONGLONG psw = m_PageStatus.ReadLL();
+  PageStatus* pst = (PageStatus*)(&psw);
+
+#ifdef DO_LOG
+  SplitInfo::RecSplit('B', this, psw, nullptr, nullptr);
+#endif
 
   // Copy a record entries for reccords that have not been deleted into a temporary array for sorting
-  UINT nrSlots = m_nSortedSet + m_PageStatus.m_Status.m_nUnsortedReserved;
+  UINT nrSlots = m_nSortedSet + pst->m_nUnsortedReserved;
   KeyPtrPair* sortArr = nullptr;
   HRESULT hr = m_Btree->m_MemoryBroker->Allocate(nrSlots * sizeof(KeyPtrPair), (void**)(&sortArr), MemObjectType::TmpPointerArray);
   if( hr != S_OK)
@@ -2274,7 +2867,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
   for (UINT i = 0; i < nrSlots; i++)
   {
 	pre = GetKeyPtrPair(i);
-	if (pre && pre->m_RecPtr)
+	if (pre && pre->m_Pointer.Read())
 	{
 	  sortArr[nrRecords] = *pre;
 	  nrRecords++;
@@ -2305,7 +2898,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
   for (UINT i = 0; i < lCount; i++)
   {
 	char* key = (char*)(this) + sortArr[i].m_KeyOffset;
-	leftPage->AppendToSortedSet(key, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
+	leftPage->AppendToSortedSet(key, sortArr[i].m_KeyLen, sortArr[i].m_Pointer.Read());
   }
 
   // Copy the higher rCount records into the right new page (higher keys)
@@ -2323,7 +2916,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
   for (UINT i = lCount; i < nrRecords; i++)
   {
 	char* key = (char*)(this) + sortArr[i].m_KeyOffset;
-	rightPage->AppendToSortedSet( key, sortArr[i].m_KeyLen, const_cast<void*>(sortArr[i].m_RecPtr));
+	rightPage->AppendToSortedSet( key, sortArr[i].m_KeyLen, sortArr[i].m_Pointer.Read());
   }
  
   // Use the last key of the left page as separator for the two pages.
@@ -2331,11 +2924,32 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
   // The separator will be added to the parent index page.
   char* separator = (char*)(leftPage)+leftPage->GetKeyPtrPair(lCount-1)->m_KeyOffset;
   UINT seplen = leftPage->GetKeyPtrPair(lCount-1)->m_KeyLen;
+  _ASSERTE(LiveRecordCount() == leftPage->LiveRecordCount() + rightPage->LiveRecordCount());
+
+#ifdef _DEBUG
+  leftPage->m_SrcPage1 = this;
+  rightPage->m_SrcPage1 = this;  
+  m_TrgtPage1 = leftPage;
+  m_TrgtPage2 = rightPage;
+#endif
 
   // Install the new pages
   btr = m_Btree->InstallNewPages(iter, leftPage, rightPage, separator, seplen);
-  if (btr == BT_INSTALL_FAILED)
+
+  iter->m_TrInfo->RecordAction(TraceInfo::SPLI_PAGE, btr == BT_SUCCESS, this, leftPage, rightPage);
+#ifdef DO_LOG 
+  SplitInfo::RecSplit('E', this, psw, leftPage, rightPage);
+#endif
+   if (btr == BT_INSTALL_FAILED)
   {
+	leftPage->m_SrcPage2 = rightPage;
+	while (true)
+	{
+	  BtreePage* expVal = const_cast<BtreePage*>(m_Btree->m_FailList);
+	  rightPage->m_SrcPage2 = expVal;
+	  LONGLONG oldVal = InterlockedCompareExchange64((LONGLONG*)(&m_Btree->m_FailList), LONGLONG(leftPage), LONGLONG(expVal));
+	  if (oldVal == LONGLONG(expVal)) break;
+	}
 	m_Btree->m_EpochMgr->Deallocate(leftPage, MemObjectType::LeafPage);
 	m_Btree->m_EpochMgr->Deallocate(rightPage, MemObjectType::LeafPage);
   }
@@ -2369,12 +2983,12 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 
    if (mySlot > 0)
    {
-	 leftPage = (BtreePage*)(parent->GetKeyPtrPair(mySlot - 1)->m_RecPtr);
+	 leftPage = parent->GetKeyPtrPair(mySlot - 1)->m_Pointer.ReadPP();
 	 leftPage->LiveRecordSpace(leftCount, leftKeySpace);
   }
    if (mySlot+1 < parent->SortedSetSize())
    {
-	 rightPage = (BtreePage*)(parent->GetKeyPtrPair(mySlot + 1)->m_RecPtr);
+	 rightPage = parent->GetKeyPtrPair(mySlot + 1)->m_Pointer.ReadPP();
 	 rightPage->LiveRecordSpace(rightCount, rightKeySpace);
    }
 
@@ -2405,8 +3019,6 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 	 UINT pageSize = m_Btree->ComputeLeafPageSize(leftCount + myCount, leftKeySpace + myKeySpace, 0);
 	 if (pageSize <= m_Btree->m_MaxPageSize)
 	 {
-		ClosePage();
-		leftPage->ClosePage();
 		btr = MergeLeafPages(leftPage, false, &newPage);
 	   rightPage = nullptr;
 	   slotToDelete = mySlot - 1;
@@ -2419,8 +3031,6 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 	  UINT pageSize = m_Btree->ComputeLeafPageSize(rightCount + myCount, rightKeySpace + myKeySpace, 0);
 	  if (pageSize <= m_Btree->m_MaxPageSize)
 	  {
-		ClosePage();
-		rightPage->ClosePage();
 		btr = MergeLeafPages(rightPage, true, &newPage);
 		leftPage = nullptr;
 		slotToDelete = mySlot;
@@ -2442,7 +3052,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 
 	 parent->ShrinkIndexPage(slotToDelete, newParent);
 	 KeyPtrPair* myNewEntry = newParent->GetKeyPtrPair(slotToDelete);
-	 myNewEntry->m_RecPtr = newPage;
+	 myNewEntry->m_Pointer = (char*)(newPage);
 
 	 // Determine where to install the new page
       BtreePage** installAddr = nullptr;
@@ -2452,13 +3062,13 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 	 if (parentIndx == 0)
       {
           // The b-tree object is the grandparent
-          installAddr = const_cast<BtreePage**>(&m_Btree->m_RootPage);
+          installAddr = (BtreePage**)(&m_Btree->m_RootPage);
       }
       else
       {
 	   BtreePage* grandParentPage = (BtreePage*)(iter->m_Path[parentIndx - 1].m_Page);
 	   KeyPtrPair* recEntry = grandParentPage->GetKeyPtrPair(iter->m_Path[parentIndx - 1].m_Slot);
-          installAddr = (BtreePage**)(&recEntry->m_RecPtr);
+          installAddr = (BtreePage**)(&recEntry->m_Pointer);
       }
 
 	 LONG64 oldval = InterlockedCompareExchange64((LONG64*)(installAddr), LONG64(newParent), LONG64(parent));
@@ -2466,8 +3076,8 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 	 {
 	   btr = BT_INSTALL_FAILED;
 	   goto exit;
-  }
-	 InterlockedIncrement(&m_Btree->m_nPageMerges);
+	 }
+	 m_Btree->m_nPageMerges++;
   }
 
 
@@ -2494,7 +3104,7 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
  // Merge two leaf pages: this and otherPage. 
  BTRESULT BtreePage::MergeLeafPages(BtreePage* otherPage, bool mergeOnRight, BtreePage** newPage)
  {
-   _ASSERTE(IsLeafPage() && otherPage->IsLeafPage());
+   _ASSERTE(IsLeafPage() && otherPage && otherPage->IsLeafPage());
 
    BTRESULT btr = BT_SUCCESS;
 
@@ -2509,6 +3119,10 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
 
    BtreePage* newLeafPage = nullptr;
    *newPage = nullptr;
+
+   // Close the two input pages
+   CloseLeafPage();
+   otherPage->CloseLeafPage();
 
    if (mergeOnRight)
    {
@@ -2538,13 +3152,13 @@ BTRESULT BtreePage::SplitLeafPage(BtIterator* iter)
    {
 	 KeyPtrPair* pre = &leftSortedArr[i];
 	 char* key = leftBase + pre->m_KeyOffset;
-	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, pre->m_Pointer.Read());
    }
    for (UINT i = 0; i < rightRecCount; i++)
    {
 	 KeyPtrPair* pre = &rightSortedArr[i];
 	 char* key = rightBase + pre->m_KeyOffset;
-	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, const_cast<void*>(pre->m_RecPtr));
+	 newLeafPage->AppendToSortedSet(key, pre->m_KeyLen, pre->m_Pointer.Read());
    }
    *newPage = newLeafPage;
 
@@ -2568,9 +3182,74 @@ int DefaultCompareKeys(const void* key1, const int keylen1, const void* key2, co
   int res = strncmp((char*)(key1), (char*)(key2), minlen);
   if (res == 0)
   {
-	// The shorter one is earlier in sort ordere
+	// The shorter one is earlier in sort order
     if (keylen1 < keylen2) res = -1;
 	else if (keylen1 > keylen2) res = 1;
   }
   return res;
 }
+
+
+#ifdef DO_LOG
+volatile LONGLONG EventCounter = 0;
+LogRec  EventLog[MaxLogEntries];
+
+
+LogRec* NewEvent(char action, char BorE)
+{
+  UINT64 pos = InterlockedIncrement64(&EventCounter) - 1;
+  LogRec* event = &EventLog[pos];
+  event->m_Time = pos;
+  event->m_ThreadId = GetCurrentThreadId();
+  event->m_Action = action;
+  event->m_BeginEnd = BorE;
+  return event;
+}
+
+void InsertInfo::RecInsert(char BorE, char* key, UINT keylen, BtreePage* page, LONGLONG pstatus, PathEntry* prior)
+{
+  LogRec* pre = NewEvent('I', BorE);
+  InsertInfo* pii = &pre->m_Insert;
+  pii->m_Key = key;
+  pii->m_KeyLen = keylen;
+  pii->m_Page = page;
+  pii->m_Status = pstatus;
+  if (prior)
+  {
+	pii->m_Prior = *prior;
+  }
+}
+
+void ConsInfo::RecCons(char BorE, BtreePage* trgt, LONGLONG status, BtreePage* newpage, LONGLONG newstatus, UINT reccount)
+{
+  LogRec* pre = NewEvent('C', BorE);
+  ConsInfo* pci = &pre->m_Cons;
+  pci->m_TrgPage = trgt;
+  pci->m_TrgtStatus = status;
+  pci->m_NewPage = newpage;
+  pci->m_NewStatus = newstatus;
+  pci->m_RecCount = reccount;
+}
+
+void SplitInfo::RecSplit(char BorE, BtreePage* srcpage, LONGLONG srcstate, BtreePage* left, BtreePage* right)
+{
+  LogRec* pre = NewEvent('S', BorE);
+  SplitInfo* psi = &pre->m_Split;
+  psi->m_SrcPage = srcpage;
+  psi->m_SrcStatus = srcstate;
+  psi->m_LeftPage = left;
+  psi->m_RightPage = right;
+}
+
+
+void PrintLog(FILE* file, int eventCount)
+{
+  
+  fprintf(file, "====== Event log =======\n");
+
+  for (LONGLONG i = EventCounter - 1, cnt = 0; i >= 0, cnt < eventCount; i--,cnt++)
+  {
+	EventLog[i].Print(file);
+  }
+}
+#endif DO_LOG
