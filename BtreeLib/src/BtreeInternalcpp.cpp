@@ -185,6 +185,15 @@ tryagain:
 	  }
 	}
 
+    if (indx >= 0)
+    {
+        pre = GetKeyPtrPair(indx);
+        if(!pre->m_Pointer.ReadPP())
+        {
+            indx = -1;
+        }
+    }
+
     return indx;
 }
 
