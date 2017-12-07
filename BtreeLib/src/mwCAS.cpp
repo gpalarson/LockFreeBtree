@@ -27,9 +27,15 @@
 #include <assert.h>
 #include "mwcas.h"
 
-UINT64 DescSize = sizeof(MwCASDescriptor);
+// Global pool of descriptors. 
+static MwCasDescriptorPool g_MwCASDescriptorPool;
 
-void MwCasStats::AddCounts(MwCasCounts partCounts[])
+MwCASDescriptor* AllocateMwCASDescriptor(ULONG flagPos)
+{
+    return g_MwCASDescriptorPool.AllocateMwCASDescriptor(flagPos);
+}
+
+void MwCasStats::AddCounts(MwCasCounts* partCounts)
 {
   if (partCounts)
   {
@@ -71,17 +77,6 @@ void MwCasDescriptorPool::PrintMwCasStats()
 	sumStats.AddCounts(m_PartitionTbl[i].m_StatsCounts);
   }
   sumStats.PrintStats();
-}
-
-// Pool of descriptors for multi-word CAS operations.
-// The pool is global and shared by multiple hash tables.
-static volatile MwCasDescriptorPool* s_pMwCASDescPool = nullptr;
-
-volatile MwCasDescriptorPool* GetDescriptorPool() { return s_pMwCASDescPool; }
-
-bool SetDescriptorPool(MwCasDescriptorPool* pool)
-{
-  return InterlockedCompareExchange64((LONG64*)(&s_pMwCASDescPool), LONG64(pool), NULL) == NULL;
 }
 
 MwCasDescriptorPartition::MwCasDescriptorPartition(MwCasDescriptorPool* ownerPool, UINT preallocate)
@@ -130,7 +125,9 @@ MwCasDescriptorPartition::~MwCasDescriptorPartition()
 // The MWCAS descriptor pool must be initialized before starting to allocate descriptors.
 MwCasDescriptorPool::MwCasDescriptorPool(UINT partitions, UINT preallocate )
 {
-	m_RefCount = 0;
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	UINT numCPU = sysinfo.dwNumberOfProcessors;
 
 	// Round nr of partitions to a power of two but no higher than 1024
 	m_PartitionCount = 1;
@@ -143,24 +140,27 @@ MwCasDescriptorPool::MwCasDescriptorPool(UINT partitions, UINT preallocate )
 	m_DescInPool = 0;
 	m_PartitionTbl = (MwCasDescriptorPartition*)( _aligned_malloc(sizeof(MwCasDescriptorPartition)*m_PartitionCount, CACHE_LINE_SIZE));
 	assert(m_PartitionTbl);
+
+    // Initially allocate per partition at most as many descriptors as CPUs
+    UINT descCount = min(preallocate, numCPU);
 	for (UINT i = 0; i < partitions; i++)
 	{
-	  new(&m_PartitionTbl[i]) MwCasDescriptorPartition(this, preallocate);
-	  m_DescInPool += preallocate;
+	  new(&m_PartitionTbl[i]) MwCasDescriptorPartition(this, descCount);
+	  m_DescInPool += descCount ;
 	}
 	
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-
-	UINT numCPU = sysinfo.dwNumberOfProcessors;
 	m_MaxPoolSize = max(4 * numCPU, 2 * m_DescInPool);
+
+#ifdef _DEBUG
+    fprintf(stdout, "Descriptor pool initialized\n");
+    fprintf(stdout, "%d partitions, %d descriptors each of size %d bytes\n", m_PartitionCount, descCount, INT(sizeof(MwCASDescriptor)));
+#endif
 }
 
 MwCasDescriptorPool::~MwCasDescriptorPool()
 {
   m_MaxPoolSize = 0;
   m_DescInPool = 0;
-  m_RefCount = 0;
   for (UINT32 i = 0; i < m_PartitionCount; i++)
   {
 	m_PartitionTbl[i].~MwCasDescriptorPartition();
@@ -168,9 +168,11 @@ MwCasDescriptorPool::~MwCasDescriptorPool()
 }
 
 // Get a free MwCASDescriptor from the pool.
-MwCASDescriptor* MwCasDescriptorPool::AllocateMwCASDescriptor(UINT64 mask)
+MwCASDescriptor* MwCasDescriptorPool::AllocateMwCASDescriptor(ULONG flagPos)
 {
-  UINT slot = ScrambleThreadId(GetCurrentThreadId()) & (m_PartitionCount - 1);
+  _ASSERTE(flagPos < 64);
+
+  UINT slot = HashThreadId(GetCurrentThreadId()) & (m_PartitionCount - 1);
   MwCASDescriptor* desc = nullptr;
   do {
 	desc = m_PartitionTbl[slot].AllocateMwCASDescriptor();
@@ -183,7 +185,7 @@ MwCASDescriptor* MwCasDescriptorPool::AllocateMwCASDescriptor(UINT64 mask)
 	  if (!newdesc) break;	  // Out of memory
 
 	  new(newdesc) MwCASDescriptor(&m_PartitionTbl[slot]);
-	  m_PartitionTbl[slot].ReturnDescriptorToPartition(newdesc);
+	  m_PartitionTbl[slot].ReleaseMwCASDescriptor(newdesc);
 	  m_DescInPool++;
 	}
   } while (!desc);
@@ -191,7 +193,8 @@ MwCASDescriptor* MwCasDescriptorPool::AllocateMwCASDescriptor(UINT64 mask)
   if (desc)
   {
 	desc->m_Count = 0;
-	desc->m_FlagBitMask = mask;
+	desc->m_FlagBitMask = (UINT64)(1) << flagPos;
+    ;
 
 	_ASSERTE(desc->m_DescStatus.Status32 == MwCASDescriptor::FINISHED);
 	_ASSERTE(desc->m_DescStatus.RefCount == ~MwCASDescriptor::RefCountMask + 0);
@@ -201,11 +204,11 @@ MwCASDescriptor* MwCasDescriptorPool::AllocateMwCASDescriptor(UINT64 mask)
 }
 
 
-
+// Return a descriptor to the pool
 void MwCASDescriptor::ReturnDescriptorToPool()
 {
   _ASSERTE(m_OwnerPartition);
-  m_OwnerPartition->ReturnDescriptorToPartition(this);
+  m_OwnerPartition->ReleaseMwCASDescriptor(this);
 }
 
 
@@ -276,24 +279,16 @@ LONGLONG CondCASDescriptor::CondCAS(LONGLONG& finalVal, bool& ignoreResult)
   } while (IsCondCASDescriptor(retVal, m_OwnerDesc->m_FlagBitMask));
 
   // If the first phase succeeded, complete the operation 
-  // by swapping in NewValue
+  // by swapping in NewValue. If it didn't succeed, try to restore the old value.
 
-  if (retVal == m_OldVal)
-  {
-	finalVal = CompleteCondCAS(true);
-  }
-  else
-  {
-	finalVal = retVal;
-  }
-
-
+  finalVal = (retVal == m_OldVal) ? CompleteCondCAS(true) : retVal;
+ 
   m_OwnerDesc->ReleaseAccess();
 
   return retVal;
 }
 
-// Swap in NewValue if the condition variable has the expected value,
+// Swap in the new value (pointer to the MwCas descriptor) if the descriptor state is still UNDECIDED,
 // otherwise restore the old value.
 LONGLONG CondCASDescriptor::CompleteCondCAS( bool hasAccess)
 {
@@ -312,12 +307,18 @@ LONGLONG CondCASDescriptor::CompleteCondCAS( bool hasAccess)
 	}
   }
 
-  INT32 condVar = *m_CondAddr;
-  LONGLONG descptr = LONGLONG(SetDescriptorFlag(this, m_OwnerDesc->m_FlagBitMask));
+  // Determine what value to swap in
+  LONGLONG tmpval  = LONGLONG(SetDescriptorFlag(m_OwnerDesc, m_OwnerDesc->m_FlagBitMask));
+  LONGLONG replVal = (m_OwnerDesc->m_DescStatus.Status32 == MwCASDescriptor::UNDECIDED) ? tmpval : m_OldVal;
 
-  LONGLONG replVal = (condVar == m_CondVal) ? m_TmpVal : m_OldVal;
-  LONGLONG rval = InterlockedCompareExchange64(m_TargetAddr, replVal, descptr);
-  LONGLONG finalVal = (rval == descptr) ? replVal : rval;
+  // Update the target word. The first phase of the CondCAS operation set the target
+  // word to point to the CondCAS descriptor (witht the flag bit set).
+  // If the CAS fails, some other thread has already helped the operation along.
+  LONGLONG expVal = LONGLONG(SetDescriptorFlag(this, m_OwnerDesc->m_FlagBitMask));
+  LONGLONG actVal = InterlockedCompareExchange64(m_TargetAddr, replVal, expVal);
+
+  // Return the current (final) value of the target word
+  LONGLONG finalVal = (actVal == expVal) ? replVal : actVal;
  
   if (!hasAccess)
 	m_OwnerDesc->ReleaseAccess();
@@ -380,8 +381,8 @@ void MwCASDescriptor::ReleaseAccess()
 	{
 	  _ASSERT(curStatus.Status32 == MwCASDescriptor::SUCCEEDED || curStatus.Status32 == MwCASDescriptor::FAILED);
 	  m_SavedOutcome = m_DescStatus.Status32;
-	  newStatus.Status32 = FINISHED;
-	  newStatus.RefCount = ~RefCountMask + 0;
+	  newStatus.Status32 = FINISHED;            // MwCAS operation is finished
+	  newStatus.RefCount = ~RefCountMask + 0;   // so disallow helping
 	}
 	retStatus.Status64 = InterlockedCompareExchange64((LONGLONG*)(&m_DescStatus.Status64), newStatus.Status64, curStatus.Status64);
   } while (retStatus.Status64 != curStatus.Status64);
@@ -406,7 +407,7 @@ INT32 MwCASDescriptor::AddEntryToDescriptor( __in LONGLONG* addr, __in LONGLONG 
   //_ASSERTE(UINT64(addr) % sizeof(LONGLONG) == 0);
 
 	INT32 retvalue = -1 ; 
-	if( m_Count < MAX_COUNT)
+	if( m_Count < MaxWordsPerDescriptor)
 	{
 		int insertpos = m_Count ;
 		for( int i=m_Count-1; i>=0; i--)
@@ -430,11 +431,8 @@ INT32 MwCASDescriptor::AddEntryToDescriptor( __in LONGLONG* addr, __in LONGLONG 
 
 		m_CondCASDesc[insertpos].m_Type      = CONDCAS_DESCRIPTOR;
 		m_CondCASDesc[insertpos].m_OwnerDesc = this;
-		m_CondCASDesc[insertpos].m_CondAddr  = (INT32*)(&m_DescStatus.Status32);
-		m_CondCASDesc[insertpos].m_CondVal   = UNDECIDED;
 		m_CondCASDesc[insertpos].m_TargetAddr  = addr ;
 		m_CondCASDesc[insertpos].m_OldVal    = oldval ;
-		m_CondCASDesc[insertpos].m_TmpVal    = LONGLONG(SetDescriptorFlag(this, m_FlagBitMask));
 		m_CondCASDesc[insertpos].m_NewVal    = newval;
 		m_Count++ ;
 		retvalue = m_Count ;
@@ -553,7 +551,7 @@ tryagain:
 		  }
 
 		}
-		// Advancing the MWCAS to the second phase succeeds only if it's still in the first phase.
+		// Advancing the MWCAS to the second phase succeeds only if it's still UNDECIDED.
 		// This is the commit point of the operation because the second phase cannot fail.
 		UINT32 oldState = InterlockedCompareExchange((LONG*)(&m_DescStatus.Status32), newStatus, UNDECIDED);
 	}
@@ -596,7 +594,7 @@ tryagain:
 	  // Always decrement ref count, of course
 	  newStatus.RefCount--;
 
-	  // but only change its state to FINISHED if about to release the last reference
+	  // but only change descriptor state to FINISHED if about to release the last reference
 	  if (curStatus.RefCount == 1)
 	  {
 		m_SavedOutcome = m_DescStatus.Status32;
@@ -607,7 +605,7 @@ tryagain:
 	} while (curStatus.Status64 !=
 	  InterlockedCompareExchange64((LONGLONG*)&m_DescStatus.Status64, newStatus.Status64, curStatus.Status64));
 
-	// When exiting this loop and curStatus.RefCount == 1, no other threads have a pointer to the descriptor any longer
+	// When exiting this loop and curStatus.RefCount == 1, no other threads have a pointer to the descriptor
 	// so we can return the finished descriptor to the partition's free list
 	if (curStatus.RefCount == 1)
 	{

@@ -132,12 +132,12 @@ struct KeyType
 // On a leaf page, it points to a B-tree record.
 
 // Flag bit positions
-static const int DescriptorFlagPos = 63;
-static const int ClosedFlagPos     = 62;
 // A BtreePtr field contains a pointer to a BtreePage on index pages and
 // a pointer to a record on leaf pages.
 // Bit 63 is used as a flag bit by MwCAS (to identify pointers to descriptors)
-// Bit 62 is used as a flag to close the field for further updates.
+// Bit 62 is used as a flag to close the field, blocking further updates.
+static const ULONG DescriptorFlagPos = 63;
+static const ULONG ClosedFlagPos     = 62;
 typedef  MwcTargetField<char*, DescriptorFlagPos>  BtreePtr;
 static const ULONGLONG CloseBitMask = ULONGLONG(0x1) << ClosedFlagPos;
 
@@ -622,7 +622,7 @@ public:
 	  KeyPtrPair* kp = page->GetKeyPtrPair(slot);
 	  m_Path[m_Count].m_Bound = (char*)(page)+page->GetKeyPtrPair(slot)->m_KeyOffset, kp->m_KeyLen;
 	  m_Path[m_Count].m_BoundLen = kp->m_KeyLen;
-	  m_Path[m_Count].m_NextPage = kp->m_Pointer.ReadPP();
+	  m_Path[m_Count].m_NextPage = (BtreePage*)(kp->m_Pointer.ReadPP());
 	}
 	m_Count++;
   }

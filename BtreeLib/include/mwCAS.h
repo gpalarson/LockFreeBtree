@@ -38,48 +38,19 @@ class MwCASDescriptor;
 class CondCASDescriptor;
 class BtreePage;
 
+// Static parameters
+static const UINT MaxWordsPerDescriptor = 6;
+static const UINT DefaultPoolPartitions = 4;
+static const UINT DefaultDescPerPartition = 8;
+
 static const UINT CACHE_LINE_SIZE = 64;
 
-
-struct MwCasCounts
-{
-	ULONG			m_Attempts;
-	ULONG			m_Bailed;
-	ULONG			m_Succeded;
-	ULONG			m_Failed;
-	ULONG           m_HelpAttempts;
-
-	void InitCounts()
-	{
-		m_Attempts = m_Bailed = m_Succeded = m_Failed = m_HelpAttempts = 0;
-	}
-
-	MwCasCounts()
-	{
-	  InitCounts();
-	}
-};
-
-static const UINT32 s_MaxStatsDepth = 5;
-
-struct MwCasStats
-{
-	MwCasCounts     Counts[s_MaxStatsDepth];
-
-	void InitStats()
-	{
-		for (UINT32 i = 0; i < s_MaxStatsDepth; i++) Counts[i].InitCounts();
-	}
-
-	void AddCounts(MwCasCounts* partCounts);
-	void PrintStats();
-};
 
 class MwCasDescriptorBase
 {
  
 protected: 
-   enum DescriptorType:INT64 { CONDCAS_DESCRIPTOR=0, MWCAS_DESCRIPTOR }; 
+   enum DescriptorType:INT32 { CONDCAS_DESCRIPTOR=0, MWCAS_DESCRIPTOR }; 
 
   // A flag bit indicates whether a pointer is "clean" or points to a descriptor.
   // The descriptor's Type field indicates the descriptor type.	
@@ -122,7 +93,7 @@ public:
 
 // A CondCASDesriptor is used for implementing a conditional CAS operation, CondCAS,
 // where the target variable is updated to NewVal only if its value matches OldVal
-// and, in addition, a (condition) variable has the value m_CondVal
+// and, in addition, a (condition) variable has the value UNDECIDED
 // CondCAS is used in the first phase of the MwCAS operation to atomically set each target
 // variable to point to its MwCASDescriptor but only if the MwCASDescriptor status is still UNDECIDED.
 //
@@ -132,34 +103,23 @@ class  CondCASDescriptor : public MwCasDescriptorBase
 
   MwCASDescriptor*	m_OwnerDesc;		// Backpointer to parent descriptor
 
-  INT32*			m_CondAddr;			// Address of condition variable
-  INT32				m_CondVal;			// Expected value of condition variable
-
   LONGLONG*			m_TargetAddr;		// Address of word to be updated
   LONGLONG			m_OldVal;			// Expected old value
-
-  // Value assigned to target at the end of a (successful) CondCAS operation.
-  // The value is a pointer to the parent MwCASDescriptor with the low-order bit set.
-  LONGLONG			m_TmpVal;       
-  // Final value assigned to target after a (successful) MwCAS operation
-  LONGLONG			m_NewVal;		
-
+  LONGLONG			m_NewVal;	        // Final value assigned to target after a (successful) MwCAS operation	
   
 public:
 
   CondCASDescriptor()
 	:MwCasDescriptorBase(CONDCAS_DESCRIPTOR)
   {
-	m_CondAddr = nullptr;
-	m_CondVal  = 0;
 	m_TargetAddr = nullptr;
-	m_OldVal = m_TmpVal = m_NewVal = 0;
+	m_OldVal = m_NewVal = 0;
   }
 
   // Execute the conditional CAS operation
   LONGLONG CondCAS(LONGLONG& finalVal, bool& ignoreResult);
  
- // Swap in NewValue if the condition variable has the expected value,
+ // Swap in the new value if the condition variable has the expected value,
   // otherwise restore the old value.
   LONGLONG CompleteCondCAS( bool hasAccess = false);
  
@@ -187,7 +147,6 @@ class alignas(CACHE_LINE_SIZE) MwCASDescriptor : public MwCasDescriptorBase
 	UINT64						m_FlagBitMask;
 		
 	// Descriptor states. Valid transitions are as follows:
-	// FILLED->{SUCCEEDED, FAILED}->FINISHED->FILLED
 	enum eDescState:INT32 {FILLED, UNDECIDED, FAILED, SUCCEEDED, FINISHED } ;
 
 	// The high order bit of RefCount is used as a flag to indicate
@@ -196,11 +155,7 @@ class alignas(CACHE_LINE_SIZE) MwCASDescriptor : public MwCasDescriptorBase
 	// This mask is used to extract the actual refcount (without the bit).
 	static const UINT32 RefCountMask = 0x7fffffff;
 
-	// Setting MAX_COUNT to 4 so MwCASDescriptor occupies five cache lines.
-	// If changing this, also remember to adjust the static assert below.
-	static const int MAX_COUNT = 4 ;
 
- 
 	// Tracks the current status of the descriptor. 
 	// State and ref count packed into 64-bit word so they can be 
 	// updated atomically together. 
@@ -216,7 +171,7 @@ class alignas(CACHE_LINE_SIZE) MwCASDescriptor : public MwCasDescriptorBase
 
 	// Array of word descriptors
 	INT32				m_Count ;
-	CondCASDescriptor   m_CondCASDesc[MAX_COUNT];
+	CondCASDescriptor   m_CondCASDesc[MaxWordsPerDescriptor];
 
 	// Fields used for debugging only
 	eDescState			m_SavedOutcome;
@@ -230,15 +185,12 @@ class alignas(CACHE_LINE_SIZE) MwCASDescriptor : public MwCasDescriptorBase
 
 public:
 
-	// Function for initializing a newly allocated MwCASDescriptor. 
 	MwCASDescriptor(MwCasDescriptorPartition* owner);
 	
 	// Adds information about a new word to be modifiec by the MwCAS operator.
 	// Word descriptors are stored sorted on the word address to prevent livelocks.
 	// Return value is negative if the descriptor is full.
 	INT32 AddEntryToDescriptor( __in LONGLONG* addr, __in LONGLONG oldval, __in LONGLONG newval) ;
-
-
 
 	// Closes a descriptor after it has been filled with the required info.
 	// After that it's ready to be executed.
@@ -250,19 +202,22 @@ public:
 		m_DescStatus.Status32 = FILLED ;
 	}
 
+	// Execute the multi-word compare and swap operation.
+	bool MwCAS(UINT calldepth=0);
+
 	// Called before helping to complete an MwCAS operation.
 	// Returns true if helping is allowed and also increases the descriptor's refcount. 
-	// Returns false if helping is not allowed.
+	// Returns false if helping is no longer allowed.
 	bool SecureAcces();
 
 	// Decrements the ref count. 
 	// Return descriptor to the pool if ref count goes to zero.
 	void ReleaseAccess();
 
-
-	// Execute the multi-word compare and swap operation.
-	bool MwCAS(UINT calldepth);
-
+    // Fields that may be the target of MwCAS operations must be read
+    // using this function. It checks whether the field contains a pointer
+    // to a descriptor and, if so, helps complete the ongoing MwCAS operations.
+    // It always returns a "clean" value, never a pointer to a descriptor.
 	static LONGLONG MwCASRead(LONGLONG* addr, UINT64 typeMask)
 	{
 	  LONGLONG rval = 0;
@@ -288,14 +243,51 @@ public:
 
 } ;
 
+//static_assert (sizeof(MwCASDescriptor) <= 5*64, "MwCASDescriptor larger than five cache lines");
 
-static_assert (sizeof(MwCASDescriptor) <= 5*64, "MwCASDescriptor larger than five cache lines");
+// Struct for counting the outcome of MwCAS operations
+struct MwCasCounts
+{
+    ULONG			m_Attempts;         // No of MwCAS calls executed
+    ULONG			m_Bailed;           // Bailed out because operation had been completed by another thread
+    ULONG			m_Succeded;         // No of successful calls
+    ULONG			m_Failed;           // No of failed calls
+    ULONG           m_HelpAttempts;     // No of attempts to help
+
+    void InitCounts()
+    {
+        m_Attempts = m_Bailed = m_Succeded = m_Failed = m_HelpAttempts = 0;
+    }
+
+    MwCasCounts()
+    {
+        InitCounts();
+    }
+};
+
+static const UINT32 s_MaxStatsDepth = 5;
+
+// Counts are kept for different call depths. Level 0 is original call,
+// level 1 is an attempt to help an origional call, level 2 is an attempt
+// to help a call at level 1, and so on
+struct MwCasStats
+{
+    MwCasCounts     Counts[s_MaxStatsDepth];
+
+    void InitStats()
+    {
+        for (UINT32 i = 0; i < s_MaxStatsDepth; i++) Counts[i].InitCounts();
+    }
+
+    // Add up the counts from different partitions
+    void AddCounts(MwCasCounts* partCounts);
+    void PrintStats();
+};
 
 
 // Partitioned pool of MwCASDescriptor and CondCASDescriptor objects.
 // If implementing persistent MwCAS then MwCASDescriptors must be stored
-// in NVRAM. However, CondCASDescriptors can be stored in volatile memory
-// and need not be persisted. 
+// in NVRAM. 
 class alignas(CACHE_LINE_SIZE) MwCasDescriptorPartition
 {
 
@@ -308,6 +300,7 @@ private:
   INT32							m_DescCount;		  // Nr of descriptors in the partition
 
 
+  // Push a descriptor onto the free list
   void PushOntoQueue(__in MwCASDescriptor* pNewFirst)
   {
 	_ASSERTE(((UINT64(pNewFirst) % MEMORY_ALLOCATION_ALIGNMENT) == 0));
@@ -326,6 +319,7 @@ private:
 	}
   }
 
+  // Try to pop a descriptor from the free list
   MwCASDescriptor* PopFromQueue()
   {
 	MwCASDescriptor* pFirst = nullptr;
@@ -347,7 +341,6 @@ private:
 public:
 
   MwCasDescriptorPartition(MwCasDescriptorPool* ownerPool, UINT preallocate);
-
   ~MwCasDescriptorPartition();
  
   MwCASDescriptor* AllocateMwCASDescriptor()
@@ -355,7 +348,7 @@ public:
 	return PopFromQueue();
   }
 
-  void ReturnDescriptorToPartition(MwCASDescriptor* desc)
+  void ReleaseMwCASDescriptor(MwCASDescriptor* desc)
   {
 	_ASSERTE(desc);
 
@@ -369,16 +362,14 @@ public:
  
  };
 
+// Finally here is the definition of the descriptor pool.
+// The single, global instance of the pool is declared in MwCAS.cpp
+//
 class MwCasDescriptorPool
 {
 	friend MwCasDescriptorPartition; 
 
-	static const UINT PARTITION_COUNT = 8;
-
-	// Nr of hash tables using this descriptor pool
-	volatile LONG	  m_RefCount;
-
-	// Total number of descriptors in the pool
+    // Total number of descriptors in the pool
 	UINT32			  m_MaxPoolSize;
 	UINT32            m_DescInPool;
 	
@@ -386,17 +377,8 @@ class MwCasDescriptorPool
 	UINT32						m_PartitionCount;
 	MwCasDescriptorPartition*	m_PartitionTbl;
 
-	
-public:
-	MwCasDescriptorPool(UINT partitions, UINT preallocate);
-
-	~MwCasDescriptorPool();
-
-	void IncrementRefCount()	{ InterlockedIncrement(&m_RefCount); }
-	void DecrementRefCount()	{ InterlockedDecrement(&m_RefCount); }
-	LONG GetRefCount()			{ return m_RefCount; }
-
-	UINT ScrambleThreadId(UINT id)
+    // Need to scramble the thread ID to get a good distribution
+	UINT HashThreadId(UINT id)
 	{
 	  const UINT32 Const = 0X12B9B6A5;
 
@@ -404,16 +386,19 @@ public:
 	  hashVal = hashVal >> 5;
 	  return UINT(hashVal & 0xffffffff);
 	}
+	
+public:
+	MwCasDescriptorPool(UINT partitions= DefaultPoolPartitions, UINT preallocate=DefaultDescPerPartition);
+	~MwCasDescriptorPool();
 
 	// Get a free MwCASDescriptor from the pool.
-	MwCASDescriptor* AllocateMwCASDescriptor(UINT64 mask);
+	MwCASDescriptor* AllocateMwCASDescriptor(ULONG mask);
 
 	// Gather and print stats about MwCasOperations
 	void PrintMwCasStats();
 };
 
-volatile MwCasDescriptorPool* GetDescriptorPool();
-bool SetDescriptorPool(MwCasDescriptorPool* pool);
+MwCASDescriptor* AllocateMwCASDescriptor(ULONG flagPos);
 
 template < class T, int FlagPos = 0>
 class MwcTargetField
@@ -441,9 +426,9 @@ public:
 	return LONGLONG(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
   }
 
-  BtreePage* ReadPP()
+  T ReadPP()
   {
-	return (BtreePage*)(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
+	return (T)(MwCASDescriptor::MwCASRead((LONGLONG*)(&m_Value), typeMask));
   }
 
 

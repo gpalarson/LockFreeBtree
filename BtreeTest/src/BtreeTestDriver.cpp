@@ -14,8 +14,6 @@ char      *keyptr[MAX_KEYS];
 
 TraceInfo insertfb[SRC_KEYS];
 
-MwCasDescriptorPool descPool(4, 8);
-
 
 struct ThreadParams
 {
@@ -94,7 +92,7 @@ DWORD WINAPI ThreadFunction(void* p)
 #endif
         indx = (indx + step) % param->m_Mod;
     }
-    printf("Tread %d: %d inserts\n", param->m_ThreadId, param->m_RecsInserted);
+    printf("Thread %d: %d inserts\n", param->m_ThreadId, param->m_RecsInserted);
 
 
 	indx = param->m_Begin;
@@ -173,8 +171,6 @@ int main()
   printf("loaded %d keys, max length %d \n", csrckeys, maxlen);
 
   BtreeRoot* btree = new BtreeRootInternal();
-
-  SetDescriptorPool(&descPool);
 
   //csrckeys = 5000;
 
