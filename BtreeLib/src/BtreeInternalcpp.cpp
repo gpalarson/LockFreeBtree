@@ -1671,6 +1671,7 @@ tryagain:
 
 	   if (pst->m_PageState == PAGE_INACTIVE)
 	   {
+		 iter->PrintPath(stdout);
 		 goto tryagain;
 	   }
 
@@ -1872,45 +1873,44 @@ tryagain:
 
 BTRESULT BtreeRootInternal::DeleteRecordInternal(KeyType* key)
 {
-      LONGLONG epochId = 0;
-    m_EpochMgr->EnterEpoch(&epochId);
+  LONGLONG epochId = 0;
+  m_EpochMgr->EnterEpoch(&epochId);
 
-    BTRESULT btr = BT_SUCCESS;
-    BtIterator  iter(this);
+  BTRESULT btr = BT_SUCCESS;
+  BtIterator  iter(this);
 
-    // Locate the target leaf page 
-    btr = FindTargetPage(key, &iter);
-    BtreePage* leafPage = (BtreePage*)(iter.m_Path[iter.m_Count - 1].m_Page);
-    _ASSERTE(leafPage && btr == BT_SUCCESS);
+  // Locate the target leaf page 
+  btr = FindTargetPage(key, &iter);
+  BtreePage* leafPage = (BtreePage*)(iter.m_Path[iter.m_Count - 1].m_Page);
+  _ASSERTE(leafPage && btr == BT_SUCCESS);
 
-    btr = leafPage->DeleteRecordFromPage(key);
-    if (btr == BT_SUCCESS)
-    {
+  btr = leafPage->DeleteRecordFromPage(key);
+  if (btr == BT_SUCCESS)
+  {
 	m_nRecords--;
 	m_nDeletes++;
 
 	if (leafPage->LiveRecordCount() == 0)
-        {
+	{
 	  leafPage->DeletePage(&iter);
 	}
 	else
 	  if (leafPage->m_PageSize > m_MinPageSize && leafPage->m_WastedSpace > leafPage->NetPageSize()*m_FreeSpaceFraction)
-            {
+	  {
 		// Try to consolidate the page
-		btr = leafPage->ConsolidateLeafPage(&iter, 0);
-
-            }
+		BTRESULT res = leafPage->ConsolidateLeafPage(&iter, 0);
+	  }
 	  else
-        if (leafPage->m_PageSize <= m_MinPageSize)
-        {
-            //Try to merge page with left or right neighbor
+		if (leafPage->m_PageSize <= m_MinPageSize)
+		{
+		  //Try to merge page with left or right neighbor
 		  leafPage->TryToMergeLeafPage(&iter);
-        }
+		}
 	// leafPage may have been deleted so no more references to it after this
-        }
+  }
 
-    m_EpochMgr->ExitEpoch(epochId);
-    return btr;
+  m_EpochMgr->ExitEpoch(epochId);
+  return btr;
 }
 
 

@@ -124,8 +124,8 @@ DWORD WINAPI ThreadFunction(void* p)
 	  if (btr == BT_SUCCESS)
 	  {
 		fprintf(stdout, "Thread %d, i=%d: Deleted record found, %s\n", GetCurrentThreadId(), i, searchKey.m_pKeyValue);
-		searchKey.m_TrInfo->Print(stdout);
-		fprintf(stdout, "\n");
+		//searchKey.m_TrInfo->Print(stdout);
+		//fprintf(stdout, "\n");
 	  }
 
 #endif
@@ -140,7 +140,7 @@ DWORD WINAPI ThreadFunction(void* p)
     return 0;
 }
 
-UINT            cthreads = 1;
+UINT            cthreads = 2;
 
 
 int main()
@@ -210,7 +210,7 @@ int main()
   btree->CheckTree(stdout);
   btree->PrintStats(stdout);
 
- 
+#ifdef SKIP_NOW
   KeyType searchKey;
   char*  recordFound;
   UINT   missing = 0;
@@ -236,31 +236,8 @@ int main()
   {
 	fprintf(stdout, "No records missing from the tree\n");
   }
+#endif
 
   return 0;
 
-#ifdef NOTNOW
-  indx = 5;
-  for (UINT i = 0; i < csrckeys; i++)
-  {
-      UINT keylen = UINT(strlen(srctable[indx]));
-      searchKey.m_pKeyValue = srctable[indx];
-      searchKey.m_KeyLen = keylen;
-
-      hr = btree->DeleteRecord(&searchKey);
-      if (hr != S_OK)
-      {
-          fprintf(stdout, "Delete failed\n");
-      }
-#ifdef _DEBUG
-	  //btree->CheckTree(stdout);
-#endif
-	  if (i > 0 && (i % 5000) == 0) btree->PrintStats(stdout);
-
-      indx = (indx + step) % csrckeys;
-  }
-  btree->PrintStats(stdout);
-
-  btree->Print(stdout);
-#endif
 }
