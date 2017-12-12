@@ -140,7 +140,7 @@ DWORD WINAPI ThreadFunction(void* p)
     return 0;
 }
 
-UINT            cthreads = 1;
+UINT            cthreads = 2;
 
 
 int main()
@@ -210,7 +210,7 @@ int main()
   btree->CheckTree(stdout);
   btree->PrintStats(stdout);
 
- 
+#ifdef NOTNEEDED
   KeyType searchKey;
   char*  recordFound;
   UINT   missing = 0;
@@ -236,6 +236,7 @@ int main()
   {
 	fprintf(stdout, "No records missing from the tree\n");
   }
+#endif
 
   return 0;
 
