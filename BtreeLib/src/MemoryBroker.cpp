@@ -13,6 +13,7 @@
 #include <crtdbg.h>
 #include <stdio.h>
 #include "MemoryBroker.h"
+#include "BtreeInternal.h"
 
 // The memory broker uses this allocator if no other is specified
 static DefaultMemoryAllocator s_defaultMemoryAllocator;
@@ -150,7 +151,7 @@ __checkReturn HRESULT MemoryBroker::Free(__in void* pBytes, __in MemObjectType t
   ULONG nAllocatedSize = 0;
   HRESULT hr = m_pMemoryAllocator->GetAllocatedSize(pBytes, &nAllocatedSize);
   
-#ifdef TEMP_DISABLED
+#ifndef DO_LOG
   hr = m_pMemoryAllocator->Free(pBytes);
   if (FAILED(hr)) return hr;
 #endif
@@ -181,8 +182,11 @@ __checkReturn HRESULT MemoryBroker::FreeAligned(__in void* pBytes, __in DWORD nA
   ULONG nAllocatedSize = 0;
   HRESULT hr = m_pMemoryAllocator->GetAlignedAllocatedSize(pBytes, &nAllocatedSize);
  
+#ifdef DO_LOG
+  // Don't free memory if we are logging actions 
   hr = m_pMemoryAllocator->FreeAligned(pBytes, nAlignment);
   if (FAILED(hr)) return hr;
+#endif
 
   ::InterlockedExchangeAdd64(&m_nMemoryAllocatedCount, -(__int64)(nAllocatedSize));
 
@@ -230,10 +234,8 @@ __checkReturn HRESULT MemoryBroker::DeallocateNow(__in void* pvMemoryToFree,  __
 	return E_UNEXPECTED;
   }
 
-#ifdef TEMP_DISABLED
   hr = m_pMemoryAllocator->Free(pvMemoryToFree);
   if (FAILED(hr)) return hr;
-#endif
 
   ::InterlockedExchangeAdd64(&m_nMemoryAllocatedCount, -((__int64)nAllocatedSize));
   if (m_nMemoryAllocatedCount < 0)

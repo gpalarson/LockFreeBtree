@@ -13,6 +13,11 @@
 * reduce performance, the problem can be remedied by paritioning the counters and/or
 * the deallocation lists.
 *
+* The implmentation is designed to be non-intrusive in the sense that it doesn't
+* use any thread-local variables. In other words, threads accessing a data structure
+* that uses this epoch manager are entirely unaware of the epoch manager. For example,
+* a thread doesn't need to "register" with the epoch manager.
+*
 * The implementation is not fully lock free - the operation of advancing the epoch
 * is protected by an exclusive lock. A thread stalling while holding the lock does
 * not block other threads from making progress but it increases memory consumption

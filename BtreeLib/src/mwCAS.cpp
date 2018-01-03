@@ -583,6 +583,7 @@ tryagain:
 	  } while (IsCondCASDescriptor(curVal, m_FlagBitMask));
 
 	  LONGLONG rval = InterlockedCompareExchange64(cdesc->m_TargetAddr, replVal, descptr);
+      cdesc->m_FinalVal = (rval == descptr)? replVal: rval;
 	}
 
 
@@ -620,7 +621,20 @@ tryagain:
 	return (succeeded);
 }
 
-extern void CheckArray();
+bool MwCASDescriptor::VerifyUpdates()
+{
+    if (m_SavedOutcome == SUCCEEDED)
+    {
+        for (INT32 i = 0; i < m_Count; i++)
+        {
+            if (m_CondCASDesc[i].m_NewVal != m_CondCASDesc[i].m_FinalVal)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 
 void MwCASDescriptor::PrintDescriptor()
@@ -629,8 +643,8 @@ void MwCASDescriptor::PrintDescriptor()
   for (INT i = 0; i < m_Count; i++)
   {
 	CondCASDescriptor* cdesc = &m_CondCASDesc[i];
-	printf("Word %d(addr=%I64X, old=%I64X, new=%I64X)\n", i, ULONGLONG(const_cast<LONGLONG*>(cdesc->m_TargetAddr)), 
-	           cdesc->m_OldVal, cdesc->m_NewVal);
+	printf("Word %d(addr=%I64X, old=%I64X, new=%I64X, final=%I64X)\n", i, ULONGLONG(const_cast<LONGLONG*>(cdesc->m_TargetAddr)), 
+	           cdesc->m_OldVal, cdesc->m_NewVal, cdesc->m_FinalVal);
   }
 
 }

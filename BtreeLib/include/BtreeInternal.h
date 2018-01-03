@@ -1,4 +1,5 @@
 #pragma once
+
 #include <windows.h>
 #include <atomic>
 #include "mwCAS.h"
@@ -18,7 +19,7 @@ class BtIterator;
 
 enum BTRESULT {
   BT_SUCCESS, BT_INVALID_ARG, BT_DUPLICATE_KEY, BT_KEY_NOT_FOUND, BT_OUT_OF_MEMORY, BT_INTERNAL_ERROR,
-  BT_PAGE_CLOSED, BT_PAGE_FULL, BT_NOT_INSERTED, BT_INSTALL_FAILED, BT_NO_MERGE
+  BT_PAGE_INACTIVE, BT_PAGE_FULL, BT_NOT_INSERTED, BT_INSTALL_FAILED, BT_NO_ACTION_TAKEN
 };
 
 // Defaul functions used unless user specifies otherwise
@@ -135,11 +136,8 @@ struct KeyType
 // A BtreePtr field contains a pointer to a BtreePage on index pages and
 // a pointer to a record on leaf pages.
 // Bit 63 is used as a flag bit by MwCAS (to identify pointers to descriptors)
-// Bit 62 is used as a flag to close the field, blocking further updates.
 static const ULONG DescriptorFlagPos = 63;
-static const ULONG ClosedFlagPos     = 62;
 typedef  MwcTargetField<char*, DescriptorFlagPos>  BtreePtr;
-static const ULONGLONG CloseBitMask = ULONGLONG(0x1) << ClosedFlagPos;
 
 #pragma pack(push)
 #pragma pack(2)
@@ -158,46 +156,17 @@ struct KeyPtrPair
 	m_Pointer = 0;
   }
 
-  static bool IsClosedBitOn(ULONGLONG val)
-  {
-      return (val & CloseBitMask) != 0;
-  }
-
   void Set(UINT16 keyoffset, UINT16 keylen, void* recptr)
   {
 	m_KeyOffset = keyoffset;
 	m_KeyLen = keylen; 
 	m_Pointer = (char*)(recptr);
   }
-
-  void CloseEntry()
-  {
-      LONGLONG oldVal = m_Pointer.ReadLL();
-      LONGLONG newVal = oldVal | CloseBitMask;
-	// Don't close entries already closed
-	if ((oldVal & CloseBitMask) == 0)
-      {
-          InterlockedCompareExchange64((LONGLONG*)(&m_Pointer), newVal, oldVal);
-      }
-  }
-
-  void CleanEntry()
-  {
-     LONGLONG oldVal = m_Pointer.ReadLL();
-     LONGLONG newVal = oldVal & ~CloseBitMask;
-
-      m_Pointer = (char*)(newVal);
-  }
-
-  bool IsClosed()
-  {
-      return (ULONGLONG(m_Pointer) & CloseBitMask) != 0;
-  }
-
+ 
   bool IsDeleted()
   {
 	LONGLONG val = m_Pointer.ReadLL();
-	return( (val & ~CloseBitMask) == 0 );	
+	return( val == 0 );	
   }
 };
 
@@ -208,8 +177,8 @@ using PStatusWord = MwcTargetField<void*, DescriptorFlagPos>;
 
 #pragma pack(pop)
 
-enum ePageState : UINT8 { PAGE_NORMAL, PAGE_CLOSING, PAGE_CLOSED, PAGE_INACTIVE};
-enum ePendingAction: UINT8 {PA_NONE, PA_CONSOLIDATE, PA_SPLIT_PAGE, PA_MERGE_PAGE };
+enum ePageState : UINT8 { PAGE_NORMAL, PAGE_INACTIVE};
+enum ePendingAction: UINT8 {PA_NONE, PA_CONSOLIDATE, PA_SPLIT_PAGE, PA_MERGE_PAGE, PA_DELETE_PAGE };
 
 struct PageStatus
 {
@@ -225,35 +194,67 @@ struct PageStatus
 											// m_SlotsReserved - m_SlotsCleared is a safe upper bound on the number of actaul records on the page
  	UINT16		  m_UpdateCount;		  // Index pages: incremented when a page pointer is updated										
   };
-  bool IsClosed() { return (m_PageState == PAGE_CLOSED || m_PageState == PAGE_CLOSING); }
+
+  static bool IsPageInactive(LONGLONG curStatus)
+  {
+      LONGLONG psw = curStatus;
+      PageStatus* pst = (PageStatus*)(&psw);
+      return (pst->m_PageState == PAGE_INACTIVE);
+  }
+
+  static bool IsPageActive(LONGLONG curStatus)
+  {
+      LONGLONG psw = curStatus;
+      PageStatus* pst = (PageStatus*)(&psw);
+      return (pst->m_PageState == PAGE_NORMAL);
+  }
 
   static LONGLONG MakePageInactive(LONGLONG curStatus)
   {
 	LONGLONG newStatus = curStatus;
 	PageStatus* newpst = (PageStatus*)(&newStatus);
 	newpst->m_PageState = PAGE_INACTIVE;
+    newpst->m_PendAction = PA_NONE;
 	return newStatus;
   }
-
+ 
   static LONGLONG IncrUpdateCount(LONGLONG curStatus)
   {
-	LONGLONG newStatus = curStatus;
-	PageStatus* newpst = (PageStatus*)(&newStatus);
-	newpst->m_UpdateCount++;
-	return newStatus;
+      LONGLONG newStatus = curStatus;
+      PageStatus* newpst = (PageStatus*)(&newStatus);
+      newpst->m_UpdateCount++;
+      return newStatus;
   }
 
-  static void PrintPageStatus(FILE* file, LONGLONG psw)
+  static LONGLONG IncrClearedSlots(LONGLONG curStatus)
+  {
+      LONGLONG newStatus = curStatus;
+      PageStatus* newpst = (PageStatus*)(&newStatus);
+      _ASSERTE(newpst->m_SlotsCleared < MAXUINT16);
+      newpst->m_SlotsCleared++;
+      return newStatus;
+  }
+
+  static LONGLONG DecrClearedSlots(LONGLONG curStatus)
+  {
+      LONGLONG newStatus = curStatus;
+      PageStatus* newpst = (PageStatus*)(&newStatus);
+      _ASSERTE(newpst->m_SlotsCleared > 0 );
+      newpst->m_SlotsCleared--;
+      return newStatus;
+  }
+
+
+  static void PrintPageStatus(FILE* file, LONGLONG psw, bool isIndexPage)
   {
 	PageStatus* pst = (PageStatus*)(&psw);
 	char* state = nullptr;
 	char* action = nullptr;
 	switch (pst->m_PageState)
 	{
-	case PAGE_NORMAL:  state = "NORMAL"; break;
-	case PAGE_CLOSING: state = "CLOSING"; break;
-	case PAGE_CLOSED:  state = "CLOSED"; break;
+	case PAGE_NORMAL:   state = "NORMAL"; break;
 	case PAGE_INACTIVE: state = "INACTIVE"; break;
+    default:            state = "UNKNOWN";
 	}
 	switch (pst->m_PendAction)
 	{
@@ -261,9 +262,21 @@ struct PageStatus
 	case PA_CONSOLIDATE: action = "CONSOLIDATE"; break;
 	case PA_SPLIT_PAGE:  action = "SPLIT"; break;
 	case PA_MERGE_PAGE:  action = "MERGE"; break;
+    case PA_DELETE_PAGE: action = "DELETE"; break;
+    default:             action = "UNKNOWN";
 	}
-	fprintf(file, "Status: %s, %s, lastfree %hd, reserved %d, cleared/updates %hd ",
-	  state, action, pst->m_LastFreeByte, pst->m_nUnsortedReserved, pst->m_SlotsCleared);
+    
+	fprintf(file, "Status: %s, %s, lastfree %hd, reserved %d,  ",
+	  state, action, pst->m_LastFreeByte, pst->m_nUnsortedReserved );
+
+    if (isIndexPage)
+    {
+        fprintf(file, "update count %hd ", pst->m_UpdateCount);
+    } 
+    else
+    {
+        fprintf(file, "slots cleared %hd ", pst->m_SlotsCleared);
+    }
   }
 };
 
@@ -289,6 +302,8 @@ struct PermutationArray
   BTRESULT SortPermArray();
 
 };
+
+extern void OnLeafPageDelete(void* btreePtr, void* objToDelete, MemObjectType objType);
 
 struct BtreeStatistics
 {
@@ -372,42 +387,37 @@ protected:
   BTRESULT ExtractLiveRecords(KeyPtrPair*& liveRecArray, UINT& count, UINT& keySpace);
   BTRESULT AddRecordToPage(KeyType* key, void* recptr);
   BTRESULT DeleteRecordFromPage(KeyType* key);
- BTRESULT CopyToNewPage(BtreePage* newPage);
+  BTRESULT CopyToNewPage(BtreePage* newPage);
 
-  void CloseLeafPage();
-
-  BTRESULT TryToMergeLeafPage(BtIterator* iter);
+  BTRESULT TryToMergePage(BtIterator* iter);
   BTRESULT MergeLeafPages(BtreePage* otherPage, bool mergeOnRight, BtreePage** newPage);
   BTRESULT ConsolidateLeafPage(BtIterator* iter, UINT minFree);
   BTRESULT SplitLeafPage(BtIterator* iter);
 
-  BTRESULT TryToMergeIndexPage(BtIterator* iter);
   BTRESULT MergeIndexPages(BtreePage* otherPage, bool mergeOnRight, BtreePage** newPage);
   BTRESULT ExpandIndexPage(char* separator, UINT sepLen, BtreePage* leftPage, BtreePage* rightPage, UINT oldPos, BtreePage*& newPage);
   BTRESULT ShrinkIndexPage(UINT dropPos, BtreePage*& newIndexPage);
   BTRESULT SplitIndexPage(BtIterator* iter);
 
   BTRESULT CreatePermutationArray(PermutationArray*& permArr);
+
  
 public:
 	BtreePage(PageType type, UINT size, BtreeRootInternal* root);
 
 	bool IsLeafPage() { return m_PageType == LEAF_PAGE; }
 	bool IsIndexPage() { return m_PageType == INDEX_PAGE; }
-	bool IsClosed()    
-	{ 
-	  LONGLONG psw = m_PageStatus.ReadLL();
-	  PageStatus* pst = (PageStatus*)(&psw);
-	  return (pst->m_PageState == PAGE_CLOSED);  
-	} 
+    bool IsInactive() { return PageStatus::IsPageInactive(m_PageStatus.ReadLL());  }
 
 	BtreeRootInternal* GetBtreeRoot() { return m_Btree; }
 	KeyPtrPair* GetKeyPtrPair(UINT indx);
 	int KeySearch(KeyType* searchKey, BtreePage::CompType ctype, bool forwardScan = true);
 	UINT FreeSpace();
+    LONGLONG GetPageStatus() { return m_PageStatus.ReadLL(); }
 
-	void DeletePage(BtIterator* iter);
-
+	BTRESULT DeleteEmptyPage(BtIterator* iter);
+    void     DeletePermutationArray();
+ 
 	UINT CheckPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
 	UINT CheckLeafPage(FILE* file, KeyType* lowBound, KeyType* hiBound);
 
@@ -516,6 +526,7 @@ class BtreeRootInternal : public BtreeRoot
     atomic_uint             m_nPageSplits;        // Nr of page splits
     atomic_uint             m_nConsolidations;    // Nr of page consolidations
     atomic_uint             m_nPageMerges;        // Nr of page merges
+    atomic_uint             m_nPageDeletes;       // Nr of empty pages deleted
 
 	// List of pages that were not installed
 	volatile BtreePage*		m_FailList;
@@ -529,11 +540,12 @@ class BtreeRootInternal : public BtreeRoot
 	BTRESULT AllocateLeafPage(UINT recCount, UINT keySpace, BtreePage*& newPage);
 	BTRESULT AllocateIndexPage(UINT recCount, UINT keySpace, BtreePage*& newPage);
 
-
 	BtreePage* CreateIndexPage(BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen);
 
-	BTRESULT InstallNewPages(BtIterator* iter, BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen);
+	BTRESULT InstallSplitPages(BtIterator* iter, BtreePage* leftPage, BtreePage* rightPage, char* separator, UINT sepLen);
+    BTRESULT InstallMergedPage(BtIterator* iter, ULONG pageIndx, BtreePage* otherSrcPage, LONGLONG otherPsw, BtreePage* newPage, BtreePage* newParentPage);
 	void ComputeTreeStats(BtreeStatistics* statsp);
+    BTRESULT DoMaintenance(BtreePage* leafPage, BtIterator* iter);
 
 public:
 	BtreeRootInternal();
@@ -542,14 +554,15 @@ public:
 	BTRESULT LookupRecordInternal(KeyType* key, void*& recFound);
 	BTRESULT DeleteRecordInternal(KeyType* key);
 
-	BTRESULT TraceRecordInternal(KeyType* key);
-
 	void ClearTreeStats();
 	void PrintTreeStats(FILE* file);
 
 	void CheckTree(FILE* file);
 	void Print(FILE* file);
 
+#ifdef _DEBUG
+	BTRESULT TraceRecordInternal(KeyType* key);
+#endif
 };
 
 // Class storing the path taken when descending from the root to a leaf page
@@ -569,7 +582,7 @@ struct PathEntry
   void PrintPathEntry(FILE* file, UINT level)
   {
 	fprintf(file, "Level %d: page 0X%I64X with status ", level, LONGLONG(m_Page));
-	PageStatus::PrintPageStatus(file, LONGLONG(m_PageStatus));
+	PageStatus::PrintPageStatus(file, LONGLONG(m_PageStatus), m_Page->IsIndexPage());
 	fprintf(file, "\n         chose slot %d, separator %.*s, pointer 0X%I64X\n",
 	           m_Slot, m_BoundLen, m_Bound, LONGLONG(m_NextPage));
 	m_Page->PrintPage(file, level, false);
@@ -620,7 +633,7 @@ public:
 	if (slot >= 0)
 	{
 	  KeyPtrPair* kp = page->GetKeyPtrPair(slot);
-	  m_Path[m_Count].m_Bound = (char*)(page)+page->GetKeyPtrPair(slot)->m_KeyOffset, kp->m_KeyLen;
+	  m_Path[m_Count].m_Bound = (char*)(page)+page->GetKeyPtrPair(slot)->m_KeyOffset;
 	  m_Path[m_Count].m_BoundLen = kp->m_KeyLen;
 	  m_Path[m_Count].m_NextPage = (BtreePage*)(kp->m_Pointer.ReadPP());
 	}
@@ -654,11 +667,11 @@ struct InsertInfo
   void Print(FILE* file)
   {
 	fprintf(file, "%.*s, page 0X%I64X ", m_KeyLen, m_Key, ULONGLONG(m_Page));
-	PageStatus::PrintPageStatus(file, m_Status);
+	PageStatus::PrintPageStatus(file, m_Status, m_Page->IsIndexPage());
 	fprintf(file, "\n                            ");
 	fprintf(file, "Index term: %.*s ", m_Prior.m_BoundLen, m_Prior.m_Bound);
 	fprintf(file, "page 0X%I64X slot %d", ULONGLONG(m_Prior.m_Page), m_Prior.m_Slot);
-	PageStatus::PrintPageStatus(file, LONGLONG(m_Prior.m_PageStatus));
+	PageStatus::PrintPageStatus(file, LONGLONG(m_Prior.m_PageStatus), m_Page->IsIndexPage());
 	fprintf(file, "\n");
   }
 };
@@ -670,15 +683,31 @@ struct ConsInfo
   BtreePage*  m_NewPage;
   LONGLONG	  m_NewStatus;
   UINT		  m_RecCount;
+  BtreePage*  m_IndexPage;
+  LONGLONG    m_IndexPageStatus;
 
-  static void RecCons(char BorE, BtreePage* trgt, LONGLONG status, BtreePage* newpage, LONGLONG newstatus, UINT reccount);
+  static void RecCons(char BorE, BtreePage* trgt, LONGLONG status, BtreePage* newpage, LONGLONG newstatus, UINT reccount,
+                                 BtreePage* indexPage, LONGLONG ipStatus);
  
   void Print(FILE* file)
   {
 	fprintf(file, "page 0X%I64X, ", ULONGLONG(m_TrgPage));
-	PageStatus::PrintPageStatus(file, m_TrgtStatus);
-	fprintf(file, " recs %d, new 0X%I64X ", m_RecCount, ULONGLONG(m_NewPage));
-	PageStatus::PrintPageStatus(file, m_NewStatus);
+	PageStatus::PrintPageStatus(file, m_TrgtStatus, m_TrgPage->IsIndexPage());
+	fprintf(file, " records %d\n", m_RecCount);
+    fprintf(file, "\t\t\t");
+	fprintf(file, "index page X%I64X, ", ULONGLONG(m_IndexPage));
+	PageStatus::PrintPageStatus(file, m_IndexPageStatus, true);
+    fprintf(file, "\n");
+   if (m_NewStatus == 0)
+    {
+        fprintf(file, "consolidation failed");
+    }
+    else
+    {
+        fprintf(file, "\t\t\t");
+	    fprintf(file, " new page 0X%I64X ", ULONGLONG(m_NewPage));
+        PageStatus::PrintPageStatus(file, m_NewStatus, m_NewPage->IsIndexPage());
+    }
   }
 };
 
@@ -694,16 +723,93 @@ struct SplitInfo
   void Print(FILE* file)
   {
 	fprintf(file, "page 0X%I64X ", ULONGLONG(m_SrcPage));
-	PageStatus::PrintPageStatus(file, m_SrcStatus);
+	PageStatus::PrintPageStatus(file, m_SrcStatus, m_SrcPage->IsIndexPage());
 	fprintf(file, "left 0X%I64X, right 0X%I64X ", ULONGLONG(m_LeftPage), ULONGLONG(m_RightPage));
   }
 };
 
+struct DeleteInfo
+{
+    char*		  m_Key;
+    UINT		  m_KeyLen;
+    BtreePage*    m_Page;
+    LONGLONG	  m_Status;
+    PathEntry     m_Prior;
+    BTRESULT      m_btResult;
 
-#define MaxLogEntries 100000
+    static void RecDelete(char BorE, char* key, UINT keylen, BtreePage* page, LONGLONG pstatus, PathEntry* prior, BTRESULT btr);
+
+    void Print(FILE* file)
+    {
+        fprintf(file, "%.*s, page 0X%I64X ", m_KeyLen, m_Key, ULONGLONG(m_Page));
+        PageStatus::PrintPageStatus(file, m_Status, m_Page->IsIndexPage());
+        fprintf(file, "result code %d", INT(m_btResult));
+        fprintf(file, "\n                            ");
+        fprintf(file, "Index term: %.*s ", m_Prior.m_BoundLen, m_Prior.m_Bound);
+        fprintf(file, "page 0X%I64X slot %d", ULONGLONG(m_Prior.m_Page), m_Prior.m_Slot);
+        PageStatus::PrintPageStatus(file, LONGLONG(m_Prior.m_PageStatus), m_Prior.m_Page->IsIndexPage());
+        fprintf(file, "\n");
+    }
+};
+
+struct MergeInfo
+{
+    BtreePage*	m_SrcPage1;
+    LONGLONG	m_SrcStatus1;
+    BtreePage*	m_SrcPage2;
+    LONGLONG	m_SrcStatus2;
+    BtreePage*	m_NewPage;
+    BtreePage*  m_ParentPage;
+    LONGLONG    m_ParentStatus;
+    BtreePage*  m_GrandParentPage;
+    LONGLONG    m_GrandParentStatus;
+
+    static void RecMerge(char BorE, BtreePage* srcpage1, LONGLONG srcstate1, BtreePage* srcpage2, LONGLONG srcstatus2,
+                                    BtreePage* parentpage, LONGLONG parentstate, BtreePage* grandparentpage, LONGLONG grandparentstatus);
+
+    void Print(FILE* file)
+    {
+        fprintf(file, "page1 0X%I64X ", ULONGLONG(m_SrcPage1));
+        PageStatus::PrintPageStatus(file, m_SrcStatus1, m_SrcPage1->IsIndexPage());
+        fprintf(file, "page2 0X%I64X ", ULONGLONG(m_SrcPage2));
+        PageStatus::PrintPageStatus(file, m_SrcStatus2, m_SrcPage2->IsIndexPage());
+        fprintf(file, "new page 0X%I64X ", ULONGLONG(m_NewPage)); 
+        
+        fprintf(file, "\n\t\t\t");
+        fprintf(file, "parent page 0X%I64X ", ULONGLONG(m_ParentPage));
+        PageStatus::PrintPageStatus(file, m_ParentStatus, true);
+        fprintf(file, "grandparent page 0X%I64X ", ULONGLONG(m_GrandParentPage));
+        PageStatus::PrintPageStatus(file, m_GrandParentStatus, true);
+    }
+
+};
+
+struct DeletePageInfo
+{
+    BtreePage*  m_Page;
+    LONGLONG    m_PageStatus;
+    BtreePage*  m_ParentPage;
+    LONGLONG    m_ParentStatus;
+
+    static void RecDeletePage(char BorE, BtreePage* page, LONGLONG status, BtreePage* parent, LONGLONG parentstatus);
+
+    void Print(FILE* file)
+    {
+        fprintf(file, "page 0X%I64X ", ULONGLONG(m_Page));
+        PageStatus::PrintPageStatus(file, m_PageStatus, m_Page->IsIndexPage());
+        fprintf(file, "parent page 0X%I64X ", ULONGLONG(m_ParentPage));
+        PageStatus::PrintPageStatus(file, m_ParentStatus, true);
+    }
+};
+
+
+
+#define MaxLogEntries 900000
 extern volatile LONGLONG EventCounter;
 extern LogRec EventLog[];
 extern void PrintLog(FILE* file, int eventCount);
+extern FILE* logFile;
+extern bool  logPrintOn;
 
 
 struct LogRec
@@ -714,9 +820,12 @@ struct LogRec
   char		  m_BeginEnd;
   union
   {
-	InsertInfo m_Insert;
-	ConsInfo   m_Cons;
-	SplitInfo  m_Split;
+	InsertInfo      m_Insert;
+	ConsInfo        m_Cons;
+	SplitInfo       m_Split;
+    DeleteInfo      m_Delete;
+    MergeInfo       m_Merge;
+    DeletePageInfo  m_DeletePage;
   };
 
   LogRec()
@@ -735,6 +844,9 @@ struct LogRec
 	case 'I': m_Insert.Print(file); break;
 	case 'C': m_Cons.Print(file); break;
 	case 'S': m_Split.Print(file); break;
+    case 'D': m_Delete.Print(file); break;
+    case 'M': m_Merge.Print(file); break;
+    case 'P': m_DeletePage.Print(file); break;
 	default:
 	  fprintf(file, "Unkwown event type %c", m_Action);
 	}

@@ -105,7 +105,8 @@ class  CondCASDescriptor : public MwCasDescriptorBase
 
   LONGLONG*			m_TargetAddr;		// Address of word to be updated
   LONGLONG			m_OldVal;			// Expected old value
-  LONGLONG			m_NewVal;	        // Final value assigned to target after a (successful) MwCAS operation	
+  LONGLONG			m_NewVal;	        // New value to assign to target after a (successful) MwCAS operation
+  LONGLONG          m_FinalVal;         // Actual final value of the target workd
   
 public:
 
@@ -113,7 +114,7 @@ public:
 	:MwCasDescriptorBase(CONDCAS_DESCRIPTOR)
   {
 	m_TargetAddr = nullptr;
-	m_OldVal = m_NewVal = 0;
+	m_OldVal = m_NewVal = m_FinalVal = 0;
   }
 
   // Execute the conditional CAS operation
@@ -222,7 +223,17 @@ public:
 	{
 	  LONGLONG rval = 0;
 	  bool isMwCasDesc = false;
+      // TODO: temporary kludge to see hom much it improves performance - fix later
+      ULONGLONG ptrMask = ULONGLONG(1) << 63;
 
+      // Try fast path first
+      rval = *addr;
+      if (!IsDescriptorPtr(rval, ptrMask))
+      {
+          return rval;
+      }
+
+      // Descriptor flag is set so use slow(er) path
 	  do
 	  {
 		rval = CondCASDescriptor::CondCASRead(addr, typeMask);
@@ -238,6 +249,8 @@ public:
 	  _ASSERTE(!IsDescriptorPtr(rval, typeMask));
 	  return rval ;
 	}
+
+    bool VerifyUpdates();
 
 	void PrintDescriptor();
 

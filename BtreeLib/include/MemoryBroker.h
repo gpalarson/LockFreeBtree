@@ -102,7 +102,7 @@ public:
   __checkReturn HRESULT GetAlignedAllocatedSize(__in void* pBytes, __out DWORD* pnAllocatedSizee);
 
   // Immediate deallocation
-  __checkReturn HRESULT MemoryBroker::DeallocateNow(__in void* pvMemoryToFree, __in MemObjectType type);
+  __checkReturn HRESULT DeallocateNow(__in void* pvMemoryToFree, __in MemObjectType type);
  
   // TODO: This is specific to hash table implementation - make it generic.
   __checkReturn HRESULT GetTotalMemoryUsage(

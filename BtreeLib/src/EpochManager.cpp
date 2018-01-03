@@ -80,7 +80,7 @@ EpochManager::~EpochManager()
 
 
 // An epoch manager must be proeprly initialized before it can be used.
-// Return valuues: S_OK successfully initialized, E_POINTER input argument is NULL
+// Return values: S_OK successfully initialized, E_POINTER input argument is NULL
 //
 __checkReturn HRESULT EpochManager::Initialize(
     __in MemoryBroker* pMemoryBroker,				// Memory broker to use for allocating GCItems (broker tracks memory usage)
