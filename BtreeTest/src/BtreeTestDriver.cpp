@@ -99,9 +99,7 @@ DWORD WINAPI ThreadFunction(void* p)
 
 	  searchKey.m_TrInfo = &insertfb[i];
 
- 	  //btr = btree->DeleteRecord(&searchKey);
-
-      btr = btree->LookupRecord(&searchKey, recFound);
+ 	  btr = btree->DeleteRecord(&searchKey);
       if (btr != BT_SUCCESS)
 	  {
 		printf("Thread %d, i=%d: Delete failure, btr=%d, %s\n", GetCurrentThreadId(), i, INT(btr), searchKey.m_pKeyValue);
